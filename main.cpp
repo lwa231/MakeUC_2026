@@ -8,6 +8,11 @@
 // To use the real Pi, replace fake_pi.py with anything that prints the same lines
 // (flush every line), or pass --pi-cmd "your command".
 //
+// Rendering: a tapered thigh and calf (lathe meshes sized from the circumferences),
+// a knee ball and a foot. Every part is derived from the four measurements and one
+// overall size scale, so changing any one number resizes everything that depends on it.
+// A seat and floor give context (kShowSeatAndFloor). Soft lighting, 4x MSAA.
+//
 // Angle source, in priority order:
 //   LIVE        from the helper process
 //   AUTO DEMO   built-in sweep until live data arrives
@@ -24,12 +29,14 @@
 //   UP / DOWN     knee flexion +/-  (manual only; 0 deg = straight, flexion positive)
 //   Q / A         thigh circumference +/-
 //   W / S         calf circumference +/-
+//   - / =         overall leg size (scales every part together)
 //   LEFT / RIGHT  orbit camera
 //   SPACE         toggle the auto demo sweep
 //   R             reset angle and camera
 //   ESC           quit
 //
 // Options: --pi-cmd "command"   (default: "python fake_pi.py", or python3 off Windows)
+//          --scale s            (overall leg size, 1.0 = as measured)
 
 #ifdef _MSC_VER
   #define _CRT_SECURE_NO_WARNINGS
@@ -159,6 +166,8 @@ static void liveReaderThread(std::string cmd) {
 // ---------------------------------------------------------------- state ----
 
 constexpr float kUnitsPerCm = 0.035f;  // world units per centimeter (keeps the leg ~3 units long)
+constexpr bool kShowSeatAndFloor = true;  // false = draw only the leg
+constexpr float kMaxKneeDeg = 120.0f;     // display limit; the seat is sized so the calf clears it up to here
 
 struct LegState {
     float kneeDeg = 0.0f;         // 0 = full extension, flexion positive
@@ -168,6 +177,8 @@ struct LegState {
     float calfCircCm = 37.0f;     // circumference around the widest part of the calf
     float thighLenCm = 45.0f;     // hip -> knee
     float shinLenCm = 42.0f;      // knee -> ankle
+
+    float scale = 1.0f;           // overall leg size: scales every part together (1 = as measured)
 };
 
 static LegState g_leg;
@@ -184,11 +195,12 @@ static std::string g_piCmd = "python3 fake_pi.py";
 static float diameterCm(float circCm) { return circCm / kPi; }
 
 static void clampLeg() {
-    g_leg.kneeDeg = std::clamp(g_leg.kneeDeg, 0.0f, 140.0f);
+    g_leg.kneeDeg = std::clamp(g_leg.kneeDeg, 0.0f, kMaxKneeDeg);
     g_leg.thighCircCm = std::clamp(g_leg.thighCircCm, 20.0f, 100.0f);
     g_leg.calfCircCm = std::clamp(g_leg.calfCircCm, 15.0f, 80.0f);
     g_leg.thighLenCm = std::clamp(g_leg.thighLenCm, 20.0f, 80.0f);
     g_leg.shinLenCm = std::clamp(g_leg.shinLenCm, 20.0f, 80.0f);
+    g_leg.scale = std::clamp(g_leg.scale, 0.6f, 1.6f);
 }
 
 static void parseArgs(int argc, char** argv) {
@@ -198,6 +210,7 @@ static void parseArgs(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--calf-circ")) target = &g_leg.calfCircCm;
         else if (!std::strcmp(argv[i], "--thigh-len")) target = &g_leg.thighLenCm;
         else if (!std::strcmp(argv[i], "--shin-len")) target = &g_leg.shinLenCm;
+        else if (!std::strcmp(argv[i], "--scale")) target = &g_leg.scale;
 
         if (target && i + 1 < argc) {
             *target = (float)std::atof(argv[++i]);
@@ -206,7 +219,7 @@ static void parseArgs(int argc, char** argv) {
         } else {
             std::fprintf(stderr,
                          "Unknown or incomplete option '%s'\n"
-                         "Usage: viewer [--thigh-circ cm] [--calf-circ cm] [--thigh-len cm] [--shin-len cm]\n"
+                         "Usage: viewer [--thigh-circ cm] [--calf-circ cm] [--thigh-len cm] [--shin-len cm] [--scale s]\n"
                          "              [--pi-cmd \"command that prints samples\"]\n",
                          argv[i]);
         }
@@ -222,21 +235,41 @@ layout(location = 1) in vec3 aNormal;
 uniform mat4 uModel;
 uniform mat4 uViewProj;
 out vec3 vNormal;
+out vec3 vWorldPos;
 void main() {
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorldPos = world.xyz;
     vNormal = mat3(transpose(inverse(uModel))) * aNormal;
-    gl_Position = uViewProj * uModel * vec4(aPos, 1.0);
+    gl_Position = uViewProj * world;
 }
 )";
 
+// Soft key light (wrapped diffuse so skin does not look harsh), a cool fill light,
+// sky/ground ambient, Blinn-Phong highlight and a faint rim. Colors are treated as
+// sRGB: linearized on the way in, gamma-corrected on the way out.
 static const char* kFragSrc = R"(#version 330 core
 in vec3 vNormal;
+in vec3 vWorldPos;
 uniform vec3 uColor;
+uniform vec3 uViewPos;
+uniform float uSpec;
+uniform float uShininess;
 out vec4 FragColor;
 void main() {
-    vec3 n = normalize(vNormal);
-    vec3 lightDir = normalize(vec3(0.4, 0.8, 0.6));
-    float diff = max(dot(n, lightDir), 0.0);
-    FragColor = vec4(uColor * (0.25 + 0.75 * diff), 1.0);
+    vec3 albedo = pow(uColor, vec3(2.2));
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(uViewPos - vWorldPos);
+    vec3 L1 = normalize(vec3(0.5, 0.9, 0.7));
+    vec3 L2 = normalize(vec3(-0.7, 0.3, 0.5));
+    float d1 = max((dot(N, L1) + 0.25) / 1.25, 0.0);
+    float d2 = max(dot(N, L2), 0.0);
+    vec3 hemi = mix(vec3(0.03, 0.03, 0.04), vec3(0.12, 0.13, 0.17), 0.5 + 0.5 * N.y);
+    vec3 H = normalize(L1 + V);
+    float spec = uSpec * pow(max(dot(N, H), 0.0), uShininess);
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    vec3 col = albedo * (hemi + 0.95 * d1 + 0.18 * d2 * vec3(0.7, 0.8, 1.0))
+             + vec3(spec) + 0.10 * rim * vec3(0.6, 0.7, 1.0);
+    FragColor = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
 }
 )";
 
@@ -274,34 +307,120 @@ static GLuint makeProgram() {
 }
 
 // ----------------------------------------------------------------- mesh ----
+// ---- mesh (begin) ----
+// Every mesh is a triangle list, each vertex (x y z nx ny nz), axis along X from
+// -0.5 to +0.5 and diameter 1, so a model matrix scale(length, diameter, diameter)
+// sizes it.
 
-// Unit cylinder: axis along X from -0.5 to +0.5, diameter 1, with flat caps.
-// Triangle list, each vertex (x y z nx ny nz).
-static std::vector<float> makeCylinder(int sides = 32) {
-    std::vector<float> v;
-    v.reserve(sides * 12 * 6);
-    auto push = [&](float x, float y, float z, float nx, float ny, float nz) {
-        v.insert(v.end(), {x, y, z, nx, ny, nz});
+static float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+static float smooth01(float a, float b, float x) {
+    float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Rounds the start (u near 0) of a profile over width w with a quarter-circle.
+static float capStart(float u, float w) {
+    if (u >= w) return 1.0f;
+    float t = 1.0f - u / w;
+    return std::sqrt(std::max(0.0f, 1.0f - t * t));
+}
+static float capEnd(float u, float w) { return capStart(1.0f - u, w); }
+
+// Radius multipliers along each segment (1.0 = the measured circumference), u: 0 -> 1.
+// Thigh: hip (u=0) -> knee (u=1), widest in the upper third, narrowing toward the knee.
+static float thighProfile(float u) {
+    return lerpf(1.0f, 0.72f, smooth01(0.30f, 1.0f, u)) * capStart(u, 0.12f);
+}
+// Shin: knee (u=0) -> ankle (u=1), calf bulge near the top, narrow ankle.
+static float shinProfile(float u) {
+    float base = (u < 0.28f) ? lerpf(0.88f, 1.0f, smooth01(0.0f, 0.28f, u))
+                             : lerpf(1.0f, 0.62f, smooth01(0.28f, 1.0f, u));
+    return base * capEnd(u, 0.07f);
+}
+// Sphere / ellipsoid.
+static float ballProfile(float u) {
+    float t = 2.0f * u - 1.0f;
+    return std::sqrt(std::max(0.0f, 1.0f - t * t));
+}
+
+// Surface of revolution around X with radius 0.5 * profile(u). Normals come from the
+// profile's slope, so the shading is smooth.
+static std::vector<float> makeLathe(float (*profile)(float), int stations = 48, int sides = 40) {
+    struct V { float x, y, z, nx, ny, nz; };
+    std::vector<V> ring((size_t)(stations + 1) * (sides + 1));
+    for (int i = 0; i <= stations; ++i) {
+        float u = 0.5f - 0.5f * std::cos(kPi * (float)i / stations);  // denser near the ends
+        float m = profile(u);
+        const float e = 1e-3f;
+        float ua = std::max(u - e, 0.0f), ub = std::min(u + e, 1.0f);
+        float dm = (profile(ub) - profile(ua)) / (ub - ua);
+        float nx = -0.5f * dm, nr = 1.0f;
+        float len = std::sqrt(nx * nx + nr * nr);
+        nx /= len;
+        nr /= len;
+        for (int j = 0; j <= sides; ++j) {
+            float a = 2.0f * kPi * (float)j / sides;
+            ring[(size_t)i * (sides + 1) + j] = {u - 0.5f, 0.5f * m * std::cos(a), 0.5f * m * std::sin(a),
+                                                 nx, nr * std::cos(a), nr * std::sin(a)};
+        }
+    }
+    std::vector<float> out;
+    out.reserve((size_t)stations * sides * 6 * 6);
+    auto push = [&](const V& v) { out.insert(out.end(), {v.x, v.y, v.z, v.nx, v.ny, v.nz}); };
+    for (int i = 0; i < stations; ++i) {
+        for (int j = 0; j < sides; ++j) {
+            const V& a = ring[(size_t)i * (sides + 1) + j];
+            const V& b = ring[(size_t)(i + 1) * (sides + 1) + j];
+            const V& c = ring[(size_t)(i + 1) * (sides + 1) + j + 1];
+            const V& d = ring[(size_t)i * (sides + 1) + j + 1];
+            push(a); push(b); push(c);
+            push(a); push(c); push(d);
+        }
+    }
+    return out;
+}
+
+// Unit cube (seat, floor, chair legs).
+static std::vector<float> makeCube() {
+    struct Face { float n[3], u[3], w[3]; };
+    const Face faces[6] = {
+        {{ 1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, {{-1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
+        {{ 0, 1, 0}, {1, 0, 0}, {0, 0, 1}}, {{ 0,-1, 0}, {1, 0, 0}, {0, 0, 1}},
+        {{ 0, 0, 1}, {1, 0, 0}, {0, 1, 0}}, {{ 0, 0,-1}, {1, 0, 0}, {0, 1, 0}},
     };
-    for (int i = 0; i < sides; ++i) {
-        float a0 = 2.0f * kPi * i / sides;
-        float a1 = 2.0f * kPi * (i + 1) / sides;
-        float y0 = 0.5f * std::cos(a0), z0 = 0.5f * std::sin(a0);
-        float y1 = 0.5f * std::cos(a1), z1 = 0.5f * std::sin(a1);
-
-        // side wall (two triangles)
-        push(-0.5f, y0, z0, 0, std::cos(a0), std::sin(a0));
-        push( 0.5f, y0, z0, 0, std::cos(a0), std::sin(a0));
-        push( 0.5f, y1, z1, 0, std::cos(a1), std::sin(a1));
-        push(-0.5f, y0, z0, 0, std::cos(a0), std::sin(a0));
-        push( 0.5f, y1, z1, 0, std::cos(a1), std::sin(a1));
-        push(-0.5f, y1, z1, 0, std::cos(a1), std::sin(a1));
-
-        // end caps
-        push( 0.5f, 0, 0, 1, 0, 0); push(0.5f, y0, z0, 1, 0, 0); push(0.5f, y1, z1, 1, 0, 0);
-        push(-0.5f, 0, 0, -1, 0, 0); push(-0.5f, y1, z1, -1, 0, 0); push(-0.5f, y0, z0, -1, 0, 0);
+    std::vector<float> v;
+    v.reserve(36 * 6);
+    auto corner = [&](const Face& f, float su, float sw) {
+        for (int k = 0; k < 3; ++k) v.push_back(0.5f * f.n[k] + 0.5f * su * f.u[k] + 0.5f * sw * f.w[k]);
+        for (int k = 0; k < 3; ++k) v.push_back(f.n[k]);
+    };
+    for (const Face& f : faces) {
+        corner(f, -1, -1); corner(f, 1, -1); corner(f, 1, 1);
+        corner(f, -1, -1); corner(f, 1, 1); corner(f, -1, 1);
     }
     return v;
+}
+// ---- mesh (end) ----
+
+struct Mesh {
+    GLuint vao = 0, vbo = 0;
+    GLsizei count = 0;
+};
+
+static Mesh uploadMesh(const std::vector<float>& data) {
+    Mesh m;
+    m.count = (GLsizei)(data.size() / 6);
+    glGenVertexArrays(1, &m.vao);
+    glGenBuffers(1, &m.vbo);
+    glBindVertexArray(m.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
+    glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    return m;
 }
 
 // ------------------------------------------------------------- callbacks ---
@@ -336,6 +455,7 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_SAMPLES, 4);  // 4x MSAA: smooth edges
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
@@ -362,24 +482,20 @@ int main(int argc, char** argv) {
     glfwGetFramebufferSize(window, &g_fbWidth, &g_fbHeight);
     glViewport(0, 0, g_fbWidth, g_fbHeight);
     glEnable(GL_DEPTH_TEST);
+    glEnable(GL_MULTISAMPLE);
 
     GLuint program = makeProgram();
     GLint locModel = glGetUniformLocation(program, "uModel");
     GLint locViewProj = glGetUniformLocation(program, "uViewProj");
+    GLint locViewPos = glGetUniformLocation(program, "uViewPos");
     GLint locColor = glGetUniformLocation(program, "uColor");
+    GLint locSpec = glGetUniformLocation(program, "uSpec");
+    GLint locShin = glGetUniformLocation(program, "uShininess");
 
-    std::vector<float> mesh = makeCylinder();
-    const GLsizei vertexCount = (GLsizei)(mesh.size() / 6);
-    GLuint vao = 0, vbo = 0;
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, mesh.size() * sizeof(float), mesh.data(), GL_STATIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
+    const Mesh thighMesh = uploadMesh(makeLathe(thighProfile));
+    const Mesh shinMesh = uploadMesh(makeLathe(shinProfile));
+    const Mesh ballMesh = uploadMesh(makeLathe(ballProfile, 32, 40));  // knee ball, foot
+    const Mesh boxMesh = uploadMesh(makeCube());                      // seat, floor, chair legs
 
     double last = glfwGetTime();
     double sweepT = 0.0;
@@ -398,6 +514,8 @@ int main(int argc, char** argv) {
         if (held(GLFW_KEY_A)) g_leg.thighCircCm -= 10.0f * dt;
         if (held(GLFW_KEY_W)) g_leg.calfCircCm += 10.0f * dt;
         if (held(GLFW_KEY_S)) g_leg.calfCircCm -= 10.0f * dt;
+        if (held(GLFW_KEY_EQUAL)) g_leg.scale += 0.5f * dt;
+        if (held(GLFW_KEY_MINUS)) g_leg.scale -= 0.5f * dt;
 
         // ---- choose the angle source ----
         const long long lastLive = g_lastLiveMs.load();
@@ -427,66 +545,112 @@ int main(int argc, char** argv) {
         char title[200];
         if (quality >= 0.0f) {
             std::snprintf(title, sizeof(title),
-                          "Brace Tracker | knee %.1f deg | %s q=%.2f | thigh circ %.0f cm | calf circ %.0f cm",
-                          g_leg.kneeDeg, source, quality, g_leg.thighCircCm, g_leg.calfCircCm);
+                          "Brace Tracker | knee %.1f deg | %s q=%.2f | thigh circ %.0f cm | calf circ %.0f cm | size x%.2f",
+                          g_leg.kneeDeg, source, quality, g_leg.thighCircCm, g_leg.calfCircCm, g_leg.scale);
         } else {
             std::snprintf(title, sizeof(title),
-                          "Brace Tracker | knee %.1f deg | %s | thigh circ %.0f cm | calf circ %.0f cm",
-                          g_leg.kneeDeg, source, g_leg.thighCircCm, g_leg.calfCircCm);
+                          "Brace Tracker | knee %.1f deg | %s | thigh circ %.0f cm | calf circ %.0f cm | size x%.2f",
+                          g_leg.kneeDeg, source, g_leg.thighCircCm, g_leg.calfCircCm, g_leg.scale);
         }
         glfwSetWindowTitle(window, title);
 
         // ---- render ----
-        glClearColor(0.09f, 0.10f, 0.13f, 1.0f);
+        glClearColor(0.07f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glUseProgram(program);
 
+        // Camera orbits a point between the hip and the foot, slightly above.
         float aspect = (float)g_fbWidth / (float)g_fbHeight;
-        glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 50.0f);
+        glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 60.0f);
         float yaw = glm::radians(g_camYawDeg);
-        glm::vec3 eye(5.0f * std::sin(yaw), 0.3f, 5.0f * std::cos(yaw));  // side-on view down -Z at yaw 0
-        glm::mat4 view = glm::lookAt(eye, glm::vec3(0.3f, -0.6f, 0.0f), glm::vec3(0, 1, 0));
+        const glm::vec3 target(-0.45f, -0.95f, 0.0f);
+        const glm::vec3 eye = target + glm::vec3(5.4f * std::sin(yaw), 1.6f, 5.4f * std::cos(yaw));
+        glm::mat4 view = glm::lookAt(eye, target, glm::vec3(0, 1, 0));
         glm::mat4 viewProj = proj * view;
         glUniformMatrix4fv(locViewProj, 1, GL_FALSE, glm::value_ptr(viewProj));
+        glUniform3fv(locViewPos, 1, glm::value_ptr(eye));
 
-        glBindVertexArray(vao);
-
-        auto draw = [&](const glm::mat4& model, const glm::vec3& color) {
+        auto draw = [&](const Mesh& mesh, const glm::mat4& model, const glm::vec3& color,
+                        float spec = 0.15f, float shininess = 24.0f) {
             glUniformMatrix4fv(locModel, 1, GL_FALSE, glm::value_ptr(model));
             glUniform3fv(locColor, 1, glm::value_ptr(color));
-            glDrawArrays(GL_TRIANGLES, 0, vertexCount);
+            glUniform1f(locSpec, spec);
+            glUniform1f(locShin, shininess);
+            glBindVertexArray(mesh.vao);
+            glDrawArrays(GL_TRIANGLES, 0, mesh.count);
         };
 
-        const float thighLen = g_leg.thighLenCm * kUnitsPerCm;
-        const float shinLen = g_leg.shinLenCm * kUnitsPerCm;
-        const float thighD = diameterCm(g_leg.thighCircCm) * kUnitsPerCm;
-        const float calfD = diameterCm(g_leg.calfCircCm) * kUnitsPerCm;
+        // Every size below is derived from the four measurements (cm) and the overall
+        // scale, so changing any one of them resizes everything that depends on it.
+        auto cm = [](float v) { return v * kUnitsPerCm * g_leg.scale; };
+        const glm::mat4 I(1.0f);
+        const float thighLenCm = g_leg.thighLenCm, shinLenCm = g_leg.shinLenCm;
+        const float thighDcm = diameterCm(g_leg.thighCircCm);  // widest diameters
+        const float calfDcm = diameterCm(g_leg.calfCircCm);
+        const float footLenCm = 0.62f * shinLenCm;              // foot proportions follow the leg
+        const float footThickCm = 0.68f * calfDcm;
+        const float footWidthCm = 0.85f * calfDcm;
+        const float thighLen = cm(thighLenCm), shinLen = cm(shinLenCm);
+        const float thighD = cm(thighDcm), calfD = cm(calfDcm);
+
+        const glm::vec3 skin(0.86f, 0.66f, 0.54f);
+        const glm::vec3 metal(0.62f, 0.64f, 0.68f);
+        const glm::vec3 shoe(0.84f, 0.84f, 0.86f);
 
         // Knee is the origin. Thigh runs from the hip at -X to the knee.
         // At 0 deg the shin continues straight along +X; flexion swings it downward
         // (90 deg = shin hanging straight down, like sitting on a chair edge).
-        glm::mat4 thigh = glm::translate(glm::mat4(1.0f), glm::vec3(-thighLen * 0.5f, 0, 0));
-        thigh = glm::scale(thigh, glm::vec3(thighLen, thighD, thighD));
-        draw(thigh, glm::vec3(0.30f, 0.60f, 0.95f));
+        const glm::mat4 shinFrame = glm::rotate(I, -glm::radians(g_leg.kneeDeg), glm::vec3(0, 0, 1));
 
-        glm::mat4 shin = glm::rotate(glm::mat4(1.0f), -glm::radians(g_leg.kneeDeg), glm::vec3(0, 0, 1));
-        shin = glm::translate(shin, glm::vec3(shinLen * 0.5f, 0, 0));
-        shin = glm::scale(shin, glm::vec3(shinLen, calfD, calfD));
-        draw(shin, glm::vec3(0.95f, 0.55f, 0.25f));
+        // -- scene: seat + floor, so the leg has context (all sizes follow the leg) --
+        if (kShowSeatAndFloor) {
+            const float seatTop = -0.5f * thighD;
+            const float seatThick = cm(0.23f * thighDcm);
+            // The seat ends behind the knee, far enough back that the calf swings past its front
+            // edge without touching it, for every angle up to kMaxKneeDeg.
+            const float rCalf = cm(0.5f * calfDcm);                       // widest calf radius
+            const float seatDepth = -(seatTop - seatThick);               // knee level -> seat underside
+            const float th = glm::radians(kMaxKneeDeg);
+            const float sClear = (seatDepth - rCalf * std::cos(th)) / std::sin(th);
+            const float seatX0 = -(thighLen + cm(0.18f * thighLenCm));
+            const float seatX1 = std::min(sClear * std::cos(th) - rCalf * std::sin(th), -rCalf) - cm(1.5f);
+            const float floorY = seatTop - cm(shinLenCm + 1.5f * footThickCm);
+            const float legW = cm(0.08f * thighLenCm), legZ = cm(0.40f * thighLenCm);
+            const float legH = (seatTop - seatThick) - floorY;
+            const glm::vec3 seatColor(0.30f, 0.31f, 0.35f);
+            draw(boxMesh, glm::scale(glm::translate(I, glm::vec3(0.5f * (seatX0 + seatX1), seatTop - 0.5f * seatThick, 0)),
+                                     glm::vec3(seatX1 - seatX0, seatThick, cm(thighLenCm))), seatColor, 0.05f, 16.0f);
+            for (float lx : {seatX0 + legW, seatX1 - legW})
+                for (float lz : {-legZ, legZ})
+                    draw(boxMesh, glm::scale(glm::translate(I, glm::vec3(lx, floorY + 0.5f * legH, lz)),
+                                             glm::vec3(legW, legH, legW)), metal, 0.3f, 40.0f);
+            draw(boxMesh, glm::scale(glm::translate(I, glm::vec3(0, floorY - cm(1.0f), 0)),
+                                     glm::vec3(cm(500.0f), cm(2.0f), cm(500.0f))), glm::vec3(0.16f, 0.17f, 0.20f), 0.04f, 12.0f);
+        }
 
-        // Hinge pin: a short cylinder along Z at the knee.
-        const float jointD = 0.5f * (thighD + calfD);
-        glm::mat4 joint = glm::rotate(glm::mat4(1.0f), glm::radians(90.0f), glm::vec3(0, 1, 0));
-        joint = glm::scale(joint, glm::vec3(thighD * 1.15f, jointD, jointD));
-        draw(joint, glm::vec3(0.90f, 0.90f, 0.90f));
+        // -- thigh and shin (tapered, sized from the circumferences) --
+        draw(thighMesh, glm::scale(glm::translate(I, glm::vec3(-thighLen * 0.5f, 0, 0)),
+                                   glm::vec3(thighLen, thighD, thighD)), skin, 0.12f, 18.0f);
+        draw(shinMesh, glm::scale(glm::translate(shinFrame, glm::vec3(shinLen * 0.5f, 0, 0)),
+                                  glm::vec3(shinLen, calfD, calfD)), skin, 0.12f, 18.0f);
+
+        // -- knee ball hides the seam between the two segments --
+        const float kneeR = 0.5f * std::max(thighD * thighProfile(1.0f), calfD * shinProfile(0.0f)) * 1.02f;
+        draw(ballMesh, glm::scale(I, glm::vec3(2.0f * kneeR)), skin, 0.12f, 18.0f);
+
+        // -- foot (a shoe): points forward, i.e. along the shin frame's +Y --
+        draw(ballMesh, glm::scale(glm::translate(shinFrame, glm::vec3(shinLen + cm(0.30f * calfDcm), cm(0.23f * footLenCm), 0)),
+                                  glm::vec3(cm(footThickCm), cm(footLenCm), cm(footWidthCm))), shoe, 0.35f, 48.0f);
 
         glfwSwapBuffers(window);
     }
 
     g_running = false;
     liveThread.join();  // the helper exits when its pipe closes
-    glDeleteBuffers(1, &vbo);
-    glDeleteVertexArrays(1, &vao);
+    for (const Mesh* m : {&thighMesh, &shinMesh, &ballMesh, &boxMesh}) {
+        glDeleteBuffers(1, &m->vbo);
+        glDeleteVertexArrays(1, &m->vao);
+    }
     glDeleteProgram(program);
     glfwDestroyWindow(window);
     glfwTerminate();
