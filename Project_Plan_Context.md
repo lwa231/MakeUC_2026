@@ -1,20 +1,22 @@
 # Brace Tracker (MakeUC) — Project Context
 
-*Snapshot: 2026-11-07. Written to bring teammates (and any AI chat instances building pieces) up to speed. Where something is a decision vs. a suggestion vs. an open question, it is labeled.*
+*Snapshot: 2026-11-07, merged from the original context doc and the planning chat. Written to bring teammates (and any AI chat instances building pieces) up to speed. Each item is labeled DECIDED, RECOMMENDED, or OPEN.*
 
 ---
 
 ## 1. One-line goal
 
-A wearable knee brace system that measures **knee flexion/extension range of motion (ROM)** during a seated leg extension and shows **how ROM evolves over time**, so a physical therapy patient/clinician can track progress.
+A wearable knee brace system that measures **knee flexion/extension range of motion (ROM)** during a seated leg extension, shows the knee **live as a 3D model**, and shows **how ROM evolves over time**, so a physical therapy patient/clinician can track progress.
 
 ## 2. Scope and framing (DECIDED)
 
 **In scope**
 - Measure knee angle during **seated leg extension** (first iteration).
+- **Live 3D knee** (C++ / OpenGL with GLFW, GLAD, GLM) driven by the measured angle.
 - Per-repetition and per-session ROM metrics.
 - ROM **trend over sessions**, with an honest "is this change real or just noise?" indicator.
 - Software runs on the laptop; UI lives on the laptop.
+- Camera used to mark the **origin** (knee position) and **segment lengths/scale** for the 3D model (see §7).
 
 **Explicitly out of scope**
 - No diagnosis. No claim that a patient is "healed". No claim about ligament/graft integrity.
@@ -23,19 +25,19 @@ A wearable knee brace system that measures **knee flexion/extension range of mot
 
 **Language rule for the UI/report:** report measurements against a **user/clinician-set target** ("extension 8° short of your set target", "ROM up 12° since last week, beyond measurement noise"). Never use words like "healed", "recovered", or a condition name as a conclusion. Target values are configurable placeholders; we do not claim clinical thresholds.
 
-## 3. Hardware (DECIDED — do not re-litigate; we only use what MLH provides)
+## 3. Hardware (DECIDED — only what MLH provides)
 
 Source: MLH hardware list for MakeUC (https://www.mlh.com/resources/hardware?event=makeuc-d5). That page lists no quantities.
 
 **Worn on the patient**
-- 1x **Raspberry Pi 4** with a connector hat (assume perfect connectivity between parts)
-- 2x **Grove 3-axis digital accelerometer** (listing says ±16g, which suggests the ADXL345 variant — verify the chip printed on the board; the software self-check reads the chip ID)
-  - one above the knee (thigh), one below (shank), held by a band, wired together
-- Optional: a visual marker on the knee joint (for the camera phase)
+- 1x **Raspberry Pi 4 (4 GB)** with a connector hat. Assume the wiring between parts is fine (the two sensors are connected with Grove cables).
+- 2x **Grove 3-axis digital accelerometer**, accelerometer only, **no gyro**. The listing says ±16g, which suggests the ADXL345 variant; verify the chip printed on the board (the software self-check reads the chip ID).
+  - one above the knee (thigh), one below (shank), held by a band, wired together.
+- Printed **ArUco markers** (and/or a visual mark at the knee) for the camera phase.
 
 **Off-body**
-- **Laptop** + its webcam (or the Logitech USB webcam from the MLH list) ~3–5 ft from the knee
-- All analysis and the UI run on the laptop
+- **Laptop (Windows)** + its webcam (or the Logitech USB webcam from the MLH list) ~3–5 ft from the knee, side-on.
+- All analysis and the UI run on the laptop.
 
 The Pi only samples and streams. No processing on the Pi.
 
@@ -51,7 +53,7 @@ An agent-assisted literature pass was done and the key claims were spot-checked.
 **Sensor/camera side**
 - Two body-worn inertial sensors (thigh + shank) can measure knee angle with a few degrees of error on **slow, supported movements** such as seated knee extension. Reported: about 2–3° RMSE in some PT-exercise studies; about 5° RMSE in accelerometer-only gait work; worse (about 10° peak error) during walking due to soft-tissue artifact.
 - A **single** tilt-only accelerometer is only valid if the other limb segment stays still. We use two.
-- Accelerometers measure gravity plus motion: fast movement corrupts tilt estimates. => We gate by |a| ≈ 1 g and keep the exercise slow.
+- Accelerometers measure gravity plus motion: fast movement corrupts tilt estimates. => We gate by |a| ≈ 1 g and keep the exercise slow. With no gyro, there is nothing to fuse with, so smoothing and the quality gate are the main defenses.
 - **Webcam pose estimation (MediaPipe) is the noisier source.** Some studies on healthy adults report ~3–5° mean error; two 2026 studies found much worse (RMSE ~15° static in one; ~14° underestimation in squats in another). => Camera is a **cross-check and a bias corrector, not the primary measurement.**
 - Camera + wearable fusion improves accuracy in the literature (≈2.9° vs ≈3.9° video-only in one gait preprint) but those systems were heavier than what we can build here.
 
@@ -67,21 +69,23 @@ An agent-assisted literature pass was done and the key claims were spot-checked.
 
 Cited by the research agents but **not independently opened** (verify before relying on them): Djurić-Jovičić 2011 (Sensors, PMC3274301), Bell 2019 (Sensors 19(5):1021), the 2017 JOSPT knee ligament CPG, Russo 2026, Langley 2026.
 
-## 5. Architecture (DECIDED unless marked)
+## 5. Architecture
 
 ```
-Pi 4 (worn)                    Laptop
+Pi 4 (worn)                    Laptop (Windows)
  2x accelerometer ──TCP──▶  stream server ─▶ raw JSONL logger (always on)
  Python sampler                          ├─▶ preprocess ─▶ tilt ─▶ knee angle
-                                         ├─▶ [later] camera + fusion
-                                         └─▶ API / WebSocket ─▶ browser UI
+                                         ├─▶ camera (ArUco markers; MediaPipe later)
+                                         └─▶ localhost stream ─▶ C++/OpenGL viewer
 ```
 
-- **Language:** Python everywhere for sensing/analysis (Pi sampler + laptop engine).
-- **Backend (laptop):** Python 3.11, asyncio, FastAPI + WebSocket, NumPy/SciPy, OpenCV + MediaPipe (camera phase), SQLite.
-- **UI:** **OPEN DECISION.** Recommendation: browser dashboard (Vite + TypeScript, Three.js for the 3D leg, a light chart library) because the product is trends/history. Alternative: keep the earlier C++/OpenGL window. Pick one; don't build both.
+- **Language (DECIDED):** Python for sensing/analysis (Pi sampler + laptop engine); C++ for the 3D viewer.
+- **Backend (laptop):** Python 3.11, asyncio, NumPy/SciPy, OpenCV (+ MediaPipe in the camera phase), SQLite. FastAPI + WebSocket only if a web UI is added.
+- **3D viewer (RECOMMENDED, one open question below):** C++ with **GLFW + GLAD + GLM**, built with CMake + vcpkg on Windows (`glfw3`, `glad`, `glm`, `opencv4`; optionally `imgui` + `implot`). The viewer is a **thin client**: the Python engine publishes `{t, thigh_tilt, shank_tilt, knee_deg, quality}` over localhost and the viewer only renders it. Keeping the math in Python keeps the data contracts in §6.2 intact.
+- **History/trend views:** raw OpenGL is awkward for charts. Use **Dear ImGui + ImPlot** inside the same GLFW/GLAD app, or a small web dashboard (Vite + TypeScript, Three.js) if the team prefers web. Pick one; don't build both.
+- **Pi-side OpenGL is not planned.** The Pi 4's Mesa driver tops out around OpenGL 3.1, which conflicts with a modern GLAD 3.3 core setup, and the Pi should stay light.
 - **Machine learning (honest version):** no end-to-end neural net (no labeled data, no ground truth, no time). ML-adjacent pieces we *do* use: pretrained MediaPipe pose (no training), a Kalman/complementary filter with *adaptive* sensor trust, a small per-session calibration regression (gain + offset), and a noise-aware trend test.
-- **Transport (OPEN, recommended):** Pi connects out to the laptop as a TCP client; laptop is the server. Prefer a wired link (direct Ethernet or Pi USB gadget Ethernet) over hackathon Wi-Fi, which tends to isolate clients.
+- **Transport (RECOMMENDED):** Pi connects out to the laptop as a TCP client; laptop is the server. Prefer a wired link (direct Ethernet, or Pi USB gadget Ethernet) over hackathon Wi-Fi, which tends to isolate clients. A Pi-hosted hotspot is the fallback.
 
 ## 6. Current focus: accelerometer pipeline (Phase 1)
 
@@ -89,6 +93,7 @@ Camera comes later. First: a clean, timestamped, trustworthy **knee angle stream
 
 ### 6.1 Pi sampler (`pi/sampler.py`)
 - Config file (not hardcoded): per sensor name (`thigh`, `shank`), I2C bus, address, rate.
+- **First hardware action:** run `i2cdetect -y 1` and confirm both boards appear. Grove ADXL345 boards usually have one fixed address (0x53), so both sensors may collide. If so, give one its own bus (software I2C via the `i2c-gpio` device-tree overlay); the config already supports per-sensor bus/address.
 - **Startup self-check:** read chip ID; exit with a clear error if wrong.
 - `smbus2`, burst-read the 6 data bytes. Sensor output rate 200 Hz, full-resolution, ±16g; read at **100 Hz**; convert to g on the Pi (stream is in physical units).
 - Schedule reads against absolute deadlines (`next += period`), timestamp with `time.monotonic_ns()`. Expect some Linux jitter; the laptop resamples.
@@ -107,10 +112,15 @@ Camera comes later. First: a clean, timestamped, trustworthy **knee angle stream
 ```
 `t` = Pi monotonic nanoseconds. The laptop also records its own arrival time. Full Pi↔laptop clock sync (repeated round trips, pick the lowest-RTT estimate) is deferred until the camera joins; `hello` reserves room for it.
 
+**Engine → viewer message (localhost, one per output sample):**
+```json
+{"type":"angle","t":123999000,"thigh_tilt":12.3,"shank_tilt":47.8,"knee_deg":35.5,"quality":0.97}
+```
+
 ### 6.3 Laptop ingest (`laptop/ingest/`)
 1. asyncio TCP server: validate, check `seq` gaps, track rate/drops/jitter.
 2. **Raw logger:** every received message to a timestamped JSONL file, untouched. This is the replay/debug source and lets us retune the algorithms without redoing the exercise.
-3. Internal pub/sub bus so logger, preprocessing, and WebSocket never block each other.
+3. Internal pub/sub bus so logger, preprocessing, and the viewer feed never block each other.
 
 ### 6.4 Preprocessing and angle (`laptop/core/`)
 1. Resample to a uniform 100 Hz grid on Pi timestamps.
@@ -118,10 +128,12 @@ Camera comes later. First: a clean, timestamped, trustworthy **knee angle stream
 3. Quality value 0–1 from |a| vs 1 g.
 4. Per-segment tilt via `atan2` of two axes, from a **configurable axis map** (sagittal axis, vertical axis, signs) because mounting orientation is unknown until the sensors are on a leg.
 5. Knee angle `θ = tilt_shank − tilt_thigh + offset`.
-6. **Zero calibration:** hold the leg straight ~2 s; average to get `offset`.
+6. **Zero calibration:** hold the leg straight ~2 s; average to get `offset`. This also removes the need for perfect sensor mounting.
 7. Output: `{t, thigh_tilt, shank_tilt, knee_deg, quality}`.
 
 **Angle convention (important — sign bugs are the classic failure):** 0° = full extension, flexion positive.
+
+**Why gravity-only works here:** each sensor mostly reads the gravity vector, so each segment's tilt in the sagittal plane is observable. Yaw is not observable from gravity alone, but the knee is a hinge, so it isn't needed. Hard motion (kicks, jumps) adds acceleration on top of gravity and spikes the reading, which is why the exercise is slow and the quality value exists.
 
 Possible later upgrade: estimate the knee flexion axis from data during a calibration movement so the axis-map config disappears.
 
@@ -135,7 +147,19 @@ Possible later upgrade: estimate the knee flexion axis from data during a calibr
 - Replay of saved JSONL logs through the pipeline.
 - Mock generator includes: thigh motion during extension; sensor dropout.
 
-## 7. Later phases (planned, not started)
+## 7. 3D viewer and camera
+
+### 7.1 Viewer (C++ / GLFW / GLAD / GLM)
+- Renders a thigh and a shin (boxes or cylinders) joined at a **hinge at the knee**. The shin rotates about the hinge axis by `knee_deg`; 0° is a straight leg, flexion positive, matching §6.4.
+- Build order: (1) window + two-segment leg driven by a **fake slider angle**, (2) receive the localhost angle stream, (3) overlays (big angle readout, target band, rep counter, confidence indicator), (4) optional ImGui/ImPlot history charts, (5) optional camera feed as a textured quad or side window.
+- Because the viewer only consumes the §6.2 angle message, it can be built and tested before the sensors work.
+
+### 7.2 Camera role (camera has two jobs; the accelerometers stay primary for angle)
+- **Placement, origin and scale (DECIDED idea, details RECOMMENDED):** put **ArUco markers** (OpenCV `cv::aruco` / Python `cv2.aruco`) at marked positions — hip, knee, ankle — or on the thigh and shank bands. Detect them once in a calibration step with the person still. The knee marker gives the 3D model's **origin**. The markers' known printed size gives pixels-to-centimeters, and the hip-to-knee and knee-to-ankle distances give **thigh and shin lengths**, so the model matches the real leg. Prefer ArUco over plain colored tape: it is robust to lighting and each marker has an ID (for example 0 = hip, 1 = knee, 2 = ankle).
+- **Angle cross-check (Phase 5):** MediaPipe Pose and/or ArUco-on-bands give a camera knee angle with a per-frame visibility score. Use it to correct slow bias, never as the primary source (see §4 for the error figures). A single dot at the joint is fine for the visual overlay but not for measurement.
+- Setup: camera side-on, ~3–5 ft away, fitted clothing, full leg in view.
+
+## 8. Later phases (planned, not started)
 
 **Phase 2 — Reps and metrics**
 - Live rep counter: hysteresis state machine. Final numbers: `scipy.signal.find_peaks` on the smoothed (offline) signal with a minimum prominence.
@@ -149,9 +173,8 @@ Possible later upgrade: estimate the knee flexion axis from data during a calibr
 **Phase 4 — Calibration with known angles**
 - Hold 3–4 known angles (e.g., 90°, 60°, 30°, 0°) using an angle block or protractor; fit per-sensor gain and offset by least squares. Show the residual RMSE in the UI as our validity number, and report measured error vs. the anchors in the demo.
 
-**Phase 5 — Camera**
-- OpenCV webcam + MediaPipe Pose → sagittal knee angle with a per-frame visibility score. Camera placed side-on, fitted clothing, full leg in view.
-- Idea to evaluate: ArUco tags on the thigh and shank bands (OpenCV) for a camera angle that doesn't depend on pose estimation; a single dot at the joint is fine for the visual overlay but not for measurement.
+**Phase 5 — Camera angle and fusion**
+- OpenCV webcam + MediaPipe Pose → sagittal knee angle with a per-frame visibility score.
 - Fusion: 1D Kalman filter. Accelerometer angle drives at high rate with adaptive noise (worse when |a| ≠ 1 g); camera angle (~30 Hz) corrects slow bias, noise set by visibility. Post-session smoother for the stored numbers.
 - Needs full Pi↔laptop clock sync (handshake + cross-correlation refinement).
 
@@ -159,12 +182,22 @@ Possible later upgrade: estimate the knee flexion axis from data during a calibr
 - Live view: big angle, target band, rep counter, 3D leg, confidence indicator.
 - History view: ROM per session with noise band, per-rep table, exportable session report.
 
-## 8. Repo layout (proposed; supersedes the earlier Pico/Arduino/C++ draft)
+## 9. Time plan (about 23 hours remaining at snapshot)
+
+1. Freeze the protocol and angle convention (§6.2, §6.4) so both people can work in parallel.
+2. Person A: Pi sampler with `--fake`, then ingest + angle → hit **M1** (fake first, real Pi second).
+3. Person B: C++ viewer on a fake slider angle, then on the live localhost stream.
+4. Reps and ROM metrics, then known-angle calibration.
+5. Camera calibration with ArUco markers (origin + scale), then history/trends.
+6. **If time runs short, cut MediaPipe fusion, not the live 3D knee plus per-rep ROM.**
+
+## 10. Repo layout (proposed; supersedes the earlier Pico/Arduino/C++ draft)
 
 ```
 brace-tracker-makeuc/
 ├── README.md
 ├── PROJECT_CONTEXT.md        # this file
+├── CMakeLists.txt            # C++ viewer (vcpkg)
 ├── docs/                     # plan files handed to each builder
 ├── pi/
 │   ├── sampler.py
@@ -174,44 +207,48 @@ brace-tracker-makeuc/
 │   ├── ingest/               # tcp server, logger, bus
 │   ├── core/                 # resample, filter, tilt, angle, reps, metrics, fusion
 │   ├── store/                # sqlite
-│   ├── api/                  # FastAPI + WebSocket
-│   ├── vision/               # camera pipeline (later)
+│   ├── api/                  # localhost publisher (+ FastAPI/WebSocket if web UI)
+│   ├── vision/               # ArUco calibration, camera pipeline
 │   └── mock/                 # synthetic generators + replay
-├── ui/                       # web dashboard (or C++ viewer if chosen)
+├── viewer/                   # C++ / GLFW / GLAD / GLM (or ui/ if web is chosen)
 └── tests/
 ```
 
-## 9. Planned plan files (for handing to other chat instances)
+## 11. Planned plan files (for handing to other chat instances)
 
 1. `00-overview.md` — scope, non-goals, demo script
-2. `01-protocol.md` — Pi→laptop message schema, sync handshake, angle convention
+2. `01-protocol.md` — Pi→laptop message schema, engine→viewer message, sync handshake, angle convention
 3. `02-pi-sampler.md` — sensor reader + streamer, self-check, fake mode
 4. `03-ingest-and-angle.md` — server, logger, preprocessing, angle, zero calibration
 5. `04-engine.md` — reps, metrics, SQLite schema, trends
-6. `05-vision.md` — camera pipeline and confidence handling
-7. `06-ui.md` — dashboard, 3D leg, history
+6. `05-vision.md` — ArUco origin/scale calibration, camera angle, confidence handling
+7. `06-ui.md` — viewer, 3D leg, history
 8. `07-calibration-validation.md` — known-angle procedure and error reporting
 9. `08-mock-and-testing.md` — synthetic data and replay
 
 Each file should end with **acceptance criteria**. Everything except `02-pi-sampler.md` can be built and tested against mock data before the hardware is working.
 
-## 10. Suggested split for two people
+## 12. Suggested split for two people
 - **Person A:** Pi sampler, ingest, preprocessing/angle, reps/metrics, storage.
-- **Person B:** API, UI, 3D leg, history/trend views.
-- They meet at the data contracts (§6.2 and the Rep/Fused-state shapes) and the mock generator unblocks Person B immediately.
+- **Person B:** viewer, 3D leg, camera/ArUco calibration, history/trend views.
+- They meet at the data contracts (§6.2 and the Rep/Fused-state shapes), and the mock generator unblocks Person B immediately.
 
-## 11. Open decisions
-1. **UI stack:** web dashboard (recommended) vs. C++/OpenGL viewer. Which frameworks is each teammate comfortable with (React vs. plain TypeScript)?
+## 13. Open decisions
+1. **UI stack:** C++/OpenGL viewer (current plan, plus ImGui/ImPlot for charts) vs. web dashboard.
 2. **Transport:** wired link (recommended) vs. Wi-Fi. Pi as TCP client to the laptop (recommended)?
-3. **Sample rate:** 100 Hz assumed; any reason to go higher?
-4. **Quantities:** how many accelerometers MLH actually allows (we need 2).
-5. **Primary user:** patient doing the exercise, clinician reviewing, or both (default: one app, live patient view + history view).
-6. **Target ROM values:** configurable placeholders; who sets them for the demo?
+3. **Sensor chip and addresses:** confirm the chip and whether both boards share an address (`i2cdetect -y 1`).
+4. **Camera:** plugged into the laptop (assumed) or the Pi? How many ArUco markers, and where exactly do they go (joints vs. on the bands)?
+5. **Sample rate:** 100 Hz assumed; any reason to go higher?
+6. **Quantities:** how many accelerometers MLH actually allows (we need 2).
+7. **Primary user:** patient doing the exercise, clinician reviewing, or both (default: one app, live patient view + history view).
+8. **Target ROM values:** configurable placeholders; who sets them for the demo?
 
-## 12. Known risks
-- Both accelerometers may report the same I2C address; if so, give one its own bus (software I2C overlay) — config already supports per-sensor bus/address.
+## 14. Known risks
+- Both accelerometers may report the same I2C address; if so, give one its own bus (software I2C overlay). The config already supports per-sensor bus/address.
 - Mounting orientation of the sensors is unknown until worn => configurable axis map + zero calibration.
-- Hackathon Wi-Fi may be unreliable => prefer wired link.
+- No gyro: fast movement corrupts the angle, so keep the exercise slow and use the quality gate.
+- Hackathon Wi-Fi may be unreliable => prefer a wired link (or a Pi hotspot).
 - Webcam knee angle can be several degrees off or worse => camera is a cross-check, not the primary source.
 - Strap slippage and soft-tissue motion add error => fixed placement, slow movement, per-session calibration.
+- Windows C++ dependency setup (GLFW, GLAD, GLM, OpenCV) can eat time => use CMake + vcpkg and test a blank window early.
 - This is a prototype; no clinical validation is claimed.
