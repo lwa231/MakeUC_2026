@@ -1,0 +1,9 @@
+*.exe
+*.o
+*.obj
+build/
+lib/
+include/GLMF
+include/glm
+.vscode/settings.json
+.vscode/c_cpp_properties.json
