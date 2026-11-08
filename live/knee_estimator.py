@@ -57,7 +57,8 @@ ALPHA_MAX = 4000.0    # ... and acceleration (deg/s^2); a brisk 90 deg rep in 0.
 DYN_RES = 0.06        # (tuned) share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
 CAM_DELAY0 = 0.04     # first guess of exposure -> t_cap (s); learned while the knee moves
 CAM_DELAY_MAX = 0.25
-CAM_DELAY_GAIN = 0.17 # (tuned) learning rate of the camera delay (per frame in motion)
+CAM_DELAY_GAIN = 0.05 # learning rate of the camera delay (per frame in motion)
+CAM_DELAY_STEP = 0.06 # one frame's delay error estimate is clipped to this (s)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
@@ -317,6 +318,13 @@ class KneeFilter:
         x, P = _predict(H[i - 1][4], H[i - 1][5], t - H[i - 1][0], self.q, 0.0, t - H[i - 1][6] > GAP_S)
         nu = wrap(knee - x[0])
         s = P[0][0] + r
+        if self.w_eff < 1.0 and abs(x[1]) > CAM_DELAY_SPEED and nu * nu < (2.0 * GATE) ** 2 * s:
+            # The camera shows the knee as it was cam_delay before t_cap; a wrong delay leaves an innovation
+            # of -omega * (delay error). Learn it from moving frames, also ones the gate is about to reject
+            # (a wrong delay is what makes them disagree); frames in both directions average out offsets.
+            err = max(-CAM_DELAY_STEP, min(CAM_DELAY_STEP, -nu / x[1]))
+            wt = x[1] * x[1] / (x[1] * x[1] + 100.0 ** 2)
+            self.cam_delay = max(0.0, min(CAM_DELAY_MAX, self.cam_delay + CAM_DELAY_GAIN * wt * err))
         if nu * nu > GATE * GATE * s:
             self.rej = [f for f in self.rej if t - RELOCK_S <= f[0] < t] + [(t, x[0] + nu)]
             fit = self._line(self.rej) if len(self.rej) >= RELOCK_N else None
@@ -334,13 +342,6 @@ class KneeFilter:
             e[4:] = [x, P, H[i - 1][6], None]
             self.rej, self.n_relock = [], self.n_relock + 1
         else:
-            if self.w_eff < 1.0 and abs(x[1]) > CAM_DELAY_SPEED:
-                # The camera shows the knee as it was cam_delay before t_cap; a wrong delay leaves an
-                # innovation of -omega * (delay error). Learn it (frames in both directions average out
-                # angle offsets).
-                err = max(-0.1, min(0.1, -nu / x[1]))
-                wt = x[1] * x[1] / (x[1] * x[1] + 100.0 ** 2)
-                self.cam_delay = max(0.0, min(CAM_DELAY_MAX, self.cam_delay + CAM_DELAY_GAIN * wt * err))
             if abs(x[1]) < CAM_VAR_SPEED:
                 # Learn how noisy this camera really is (innovation^2 minus the filter's own share), from
                 # frames at rest where timing errors do not matter. Clipped so outliers count only a little.

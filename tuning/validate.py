@@ -22,9 +22,12 @@ def report(p, label=""):
 
 if __name__ == "__main__":
     p = O.current()
-    if len(sys.argv) > 1 and sys.argv[1].endswith(".json"):
-        p.update(json.load(open(sys.argv[1])))
-    for kv in sys.argv[2:]:
-        k, v = kv.split("=")
-        p[k] = float(v)
-    report(p, " ".join(sys.argv[2:]) or "params")
+    sets = []
+    for arg in sys.argv[1:]:
+        if arg.endswith(".json"):
+            p.update(json.load(open(arg)))
+        else:
+            k, v = arg.split("=")
+            p[k] = float(v)
+            sets.append(arg)
+    report(p, " ".join(sets) or "params")

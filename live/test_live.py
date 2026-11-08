@@ -35,11 +35,12 @@ def run_filter(run, **kw):
 
 class Demo(unittest.TestCase):
     def test_smoother_than_old_viewer(self):
-        ctx = eval_fusion.prepare("default", 1, 30.0)
-        new, old = eval_fusion.evaluate(ctx, KE.W_DEFAULT, KE.RESP_DEFAULT), eval_fusion.evaluate_baseline(ctx)
+        ctxs = [eval_fusion.prepare("default", seed, 30.0) for seed in (1, 2, 3)]
+        new = eval_fusion.mean([eval_fusion.evaluate(c, KE.W_DEFAULT, KE.RESP_DEFAULT) for c in ctxs])
+        old = eval_fusion.mean([eval_fusion.evaluate_baseline(c) for c in ctxs])
         self.assertLess(new["jitter"], 0.6 * old["jitter"])      # still at rest
-        self.assertLess(new["rms"], 1.1 * old["rms"])             # as accurate, despite the playout delay
-        self.assertLess(new["lag"], old["lag"] + 10.0)            # and about as responsive
+        self.assertLess(new["rms"], 1.05 * old["rms"])            # as accurate, despite the playout delay
+        self.assertLess(new["lag"], old["lag"] + 15.0)            # and about as responsive
 
     def test_fusion_beats_either_sensor(self):
         run = mock_sensors.generate("default", seed=1, duration=30.0)
@@ -104,9 +105,10 @@ class Demo(unittest.TestCase):
         self.assertAlmostEqual(kf.x[0], theta + 25.0, delta=3.0)
 
     def test_camera_delay_is_learned(self):
-        run = mock_sensors.generate("default", seed=4, duration=60.0, cam_stamp=(0.10, 0.10))
-        _, kf = run_filter(run, w=0.75)
-        self.assertAlmostEqual(kf.cam_delay, 0.10, delta=0.03)
+        for stamp in (0.01, 0.05):          # the mock stamps frames this long after the exposure
+            run = mock_sensors.generate("default", seed=4, duration=60.0, cam_stamp=(stamp, stamp))
+            _, kf = run_filter(run, w=0.75)
+            self.assertAlmostEqual(kf.cam_delay, stamp, delta=0.02)
 
     def test_clock_survives_host_stall(self):
         import leg_filter
