@@ -36,7 +36,7 @@ Arduino (MMA7660 x2) --USB 115200--> serial_bridge.py --stdout--> live/leg_filte
 | `live/run_live.py` | The launcher (stdlib only). See section 4 | VERIFIED |
 | `live/leg_filter.py` | Between source and viewer: bench correction, leg mapping (calibration sign, or invert/rot180), `knee_estimator.KneeFilter` fused with the camera, runs calibrations, writes `K`/`M` lines, heartbeat, `.stats`; SIGINTs the bridge on exit | VERIFIED with the mock (K lines at ~100 Hz track truth; calibration runs from `.tune`) |
 | `live/knee_estimator.py`, `live/calibrate.py`, `live/mock_sensors.py` | Kalman fusion + One Euro display filter; calibration procedures; simulated brace + camera | VERIFIED offline |
-| `live/leg_panel.py` | Tk window: LEFT/RIGHT, webcam with ArUco overlay, fix chips, **Fusion card** (camera share, responsiveness, source, Calibrate / Anchor / Bench check / Zero, calibration status); writes `build/leg_state.json` and `.tune`, publishes the camera angle with `t_cap`/`seq` | UI builds with `--no-camera`; **never used with the real board/webcam** |
+| `live/leg_panel.py` | Tk window: LEFT/RIGHT, webcam with ArUco overlay, **Fusion card** (camera share, responsiveness, source, Calibrate / Anchor / Bench check / Zero, calibration status); writes `build/leg_state.json` and `.tune`, publishes the camera angle with `t_cap`/`seq` | UI builds with `--no-camera`; **never used with the real board/webcam** |
 | `live/sensor_check.py` | Sends `C` to the Arduino and prints its self-check (`# thigh ... ok/FAIL`) | VERIFIED |
 | `live/sim_arduino.py` | Fake Arduino on a pty, same protocol/format as the firmware (S/X/C/I commands, 100 Hz, MMA7660 quantization) | VERIFIED |
 | `live/verify_pipeline.py` | Runs bridge against the simulator and checks format, rate, S/X handling, popen-style shutdown. 45 checks | PASS 45/45 (one run had 4 timing-artifact failures from stale sim backlog; reruns pass) |
@@ -64,11 +64,10 @@ User report: on the **left** leg the model is right side up; on the **right** le
 
 `main.cpp` shows only the knee angle `wrapDeg(kKneeSign * (tilt(shank) - tilt(thigh)) - zeroOffset)`, clamped to 0..120 for display, with `tilt = atan2(sag, vert)`, `kSagAxis=0 (x)`, `kVertAxis=2 (z)`. Axis map is compile-time.
 
-Implemented in the filter (state in `build/leg_state.json`):
-- `invert`: negate x (and the x position columns) of both sensors -> knee angle sign flips. **Default ON for right leg**, OFF for left. This is a physics-based guess (moving the brace to the other leg mirrors the lateral side); **it has not been tried on a real right leg.**
-- `rot180`: negate x and y of the shank sensor -> shin tilt +180 deg. Default OFF. Try it if the shin looks folded back over the thigh.
-- The user can flip both live from the window. Also: pressing **Z** with the leg straight absorbs any constant offset (a plain 180 deg offset may be fixed by Z alone; the user may not have pressed Z yet).
-- Because a negative knee angle is clamped to 0, a wrongly signed right leg looks "stuck straight", not upside down. If the real symptom persists after `invert` and `rot180`, measure instead of guessing: close the viewer, run `python3 serial_bridge.py --port /dev/cu.usbmodem11401 --pretty` with the brace on the right leg, bend the knee, and see which axes swing; then decide on a change (a real fix may need `kSagAxis/kVertAxis/kKneeSign` in `main.cpp` plus `build_viewer.sh`, which needs the user's OK).
+Resolved: the knee angle now comes from `live/leg_filter.py` (bend plane = each board's x-y, z = hinge
+axis), and **calibration (C) finds the bend direction and any upside-down sensor itself**. `invert` /
+`rot180` in `build/leg_state.json` are only per-leg defaults for the display before calibrating (right leg:
+invert ON); the panel no longer has chips for them or for mirroring the camera.
 - `--demo` defaults to the left leg (the mock is a left leg); with `--leg right` it reads inverted until calibrated. A completed calibration replaces invert/rot180 (it finds the bend sign itself).
 
 ## 6. State at the end of this session

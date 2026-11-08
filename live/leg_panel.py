@@ -9,11 +9,11 @@
   unmodified) and draws every ArUco marker it recognises. Three chips show which
   of the 3 markers are seen: KNEE #1, THIGH END #0, SHIN END #2.
 * Sensor stream indicator (reads STATE.json.stats written by leg_filter.py).
-* Small fix chips if a leg still looks wrong: Invert bend / Flip shin 180 / Mirror camera.
 * Fusion card: camera share (w), responsiveness, source (Fused / Sensors / Camera), Calibrate,
   Anchor, Bench check and Zero, plus leg_filter's calibration status. Writes STATE.json.tune
   {w, resp, src, zero_seq, cal_seq, cal_mode, cal_anchor_deg}; leg_filter polls it.
-Per-leg chip settings and the last leg are remembered in live/leg_config.json.
+The last leg is remembered in live/leg_config.json. Calibration finds the bend direction itself, so
+invert/rot180 are just per-leg defaults for the uncalibrated display.
 """
 import argparse
 import json
@@ -36,17 +36,12 @@ FONT = "Helvetica Neue"
 
 # ------------------------------------------------------------------ config ----
 def load_cfg():
-    cfg = {"last_leg": "right", "mirror_cam": False, "assist": True}
-    cfg.update({k: dict(v) for k, v in DEFAULTS.items()})
+    cfg = {"last_leg": "right"}
     try:
         with open(CONFIG) as f:
             d = json.load(f)
-        for leg in ("left", "right"):
-            cfg[leg].update({k: bool(v) for k, v in d.get(leg, {}).items() if k in cfg[leg]})
         if d.get("last_leg") in ("left", "right"):
             cfg["last_leg"] = d["last_leg"]
-        cfg["mirror_cam"] = bool(d.get("mirror_cam", False))
-        cfg["assist"] = bool(d.get("assist", True))
     except (OSError, ValueError):
         pass
     return cfg
@@ -73,7 +68,7 @@ def initial_state(path, leg=None):
     """Write the starting state (used by run_live.py before the viewer opens). Returns the leg."""
     cfg = load_cfg()
     leg = leg or cfg["last_leg"]
-    write_state(path, leg, cfg[leg]["invert"], cfg[leg]["rot180"])
+    write_state(path, leg, DEFAULTS[leg]["invert"], DEFAULTS[leg]["rot180"])
     return leg
 
 
@@ -157,8 +152,7 @@ def main():
 
     cfg = load_cfg()
     leg = a.leg or cfg["last_leg"]
-    st = {"leg": leg, "invert": cfg[leg]["invert"], "rot180": cfg[leg]["rot180"], "mirror": cfg["mirror_cam"],
-          "assist": True}         # the Fusion card's source buttons replace the old assist chip
+    st = dict(DEFAULTS[leg], leg=leg)
 
     root = tk.Tk()
     root.title("Brace Tracker")
@@ -221,21 +215,6 @@ def main():
         mchips[key] = c
     readout = label(chips, "", 11, fg=MUTED, bg=CARD)
     readout.pack(side="right")
-
-    # fix chips
-    fx = tk.Frame(root, bg=BG)
-    fx.pack(fill="x", padx=18, pady=(0, 6))
-    label(fx, "Options:", 11, fg=MUTED).pack(side="left", padx=(0, 8))
-    fchips = {}
-
-    def make_fix(key, text):
-        c = tk.Label(fx, text=text, font=(FONT, 11), padx=10, pady=4, cursor="hand2")
-        c.pack(side="left", padx=(0, 6))
-        c.bind("<Button-1>", lambda e, k=key: toggle(k))
-        fchips[key] = c
-    make_fix("invert", "Invert bend")
-    make_fix("rot180", "Flip shin 180°")
-    make_fix("mirror", "Mirror camera")
 
     # fusion card: how much to trust the camera vs the accelerometers, and calibration
     tune_path = a.state + ".tune"
@@ -325,27 +304,15 @@ def main():
         for n, b in segs.items():
             on = st["leg"] == n
             b.config(bg=GREEN if on else CARD, fg="white" if on else MUTED)
-        for k, c in fchips.items():
-            on = st[k]
-            c.config(bg=BLUE if on else OFF, fg="white" if on else MUTED)
 
     def push():
         write_state(a.state, st["leg"], st["invert"], st["rot180"])
         cfg["last_leg"] = st["leg"]
-        cfg[st["leg"]] = {"invert": st["invert"], "rot180": st["rot180"]}
-        cfg["mirror_cam"] = st["mirror"]
         save_cfg(cfg)
-        if tracker is not None:
-            tracker.flip_x = st["mirror"]
         refresh_widgets()
 
     def set_leg(name):
-        st["leg"] = name
-        st["invert"], st["rot180"] = cfg[name]["invert"], cfg[name]["rot180"]
-        push()
-
-    def toggle(k):
-        st[k] = not st[k]
+        st.update(DEFAULTS[name], leg=name)
         push()
 
     # ---- camera
@@ -363,7 +330,7 @@ def main():
             tracker = None
         try:
             from camera_origin import CameraTracker   # repo root, unmodified
-            t = CameraTracker(cam_index=cam["idx"], marker_cm=a.marker_cm, flip_x=st["mirror"])
+            t = CameraTracker(cam_index=cam["idx"], marker_cm=a.marker_cm)
         except Exception as e:                          # no cv2 / aruco
             cam["err"] = "OpenCV with aruco not available (%s)" % e
             return
