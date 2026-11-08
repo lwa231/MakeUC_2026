@@ -1,0 +1,27 @@
+start 16.102 {"Q_J0": 1200000.0, "ALPHA_TAU": 0.075, "R_ACC0": 1.7, "R_CAM0": 0.3, "DEV_G": 0.2, "DEAD_G": 0.0, "Q_B": 0.03, "GATE": 3.0, "DYN_RES": 0.06, "BLIP_SIGMA": 2.2, "CAM_DELAY_GAIN": 0.05, "EURO_FMIN": 0.0995, "EURO_BETA": 0.10500000000000001, "Q_BW": 0.1, "CONF_POW": 2.0, "CMAP_GAIN": 0.05, "Q_ACC_A": 6000.0, "R_ACC0_ACC": 5.7, "DEV_G_ACC": 0.084, "DEAD_G_ACC": 0.0275, "BLIP_SIGMA_ACC": 3.0, "EURO_FMIN_ACC": 0.0995, "EURO_BETA_ACC": 0.21249999999999997}
+  DYN_RES         -> 0.31       J 16.090
+  GATE            -> 4.375      J 15.375
+  GATE            -> 5.75       J 15.127
+  R_ACC0          -> 3.4        J 15.041
+  Q_J0            -> 2.4e+06    J 14.696
+  DEV_G           -> 0.1        J 14.605
+  BLIP_SIGMA      -> 3.825      J 14.602
+  CONF_POW        -> 1.25       J 14.588
+  CONF_POW        -> 0.5        J 14.585
+  CONF_POW        -> 0          J 14.580
+  EURO_BETA       -> 0.21       J 14.021
+  EURO_BETA       -> 0.42       J 14.008
+round 1: J 14.008 {"Q_J0": 2400000.0, "ALPHA_TAU": 0.075, "R_ACC0": 3.4, "R_CAM0": 0.3, "DEV_G": 0.1, "DEAD_G": 0.0, "Q_B": 0.03, "GATE": 5.75, "DYN_RES": 0.31, "BLIP_SIGMA": 3.825, "CAM_DELAY_GAIN": 0.05, "EURO_FMIN": 0.0995, "EURO_BETA": 0.42000000000000004, "Q_BW": 0.1, "CONF_POW": 0.0, "CMAP_GAIN": 0.05, "Q_ACC_A": 6000.0, "R_ACC0_ACC": 5.7, "DEV_G_ACC": 0.084, "DEAD_G_ACC": 0.0275, "BLIP_SIGMA_ACC": 3.0, "EURO_FMIN_ACC": 0.0995, "EURO_BETA_ACC": 0.21249999999999997}
+  R_CAM0          -> 0.4243     J 13.980
+  Q_BW            -> 0.07071    J 13.918
+  Q_BW            -> 0.05       J 13.839
+  Q_BW            -> 0.03536    J 13.778
+  Q_BW            -> 0.025      J 13.759
+  Q_BW            -> 0.01768    J 13.743
+  Q_B             -> 0.02121    J 13.737
+  Q_B             -> 0.015      J 13.733
+  R_ACC0          -> 4.808      J 13.719
+  ALPHA_TAU       -> 0.1061     J 13.685
+  EURO_BETA       -> 0.297      J 13.646
+round 2: J 13.646 {"Q_J0": 2400000.0, "ALPHA_TAU": 0.10606601717798213, "R_ACC0": 4.8083261120685235, "R_CAM0": 0.4242640687119285, "DEV_G": 0.1, "DEAD_G": 0.0, "Q_B": 0.014999999999999998, "GATE": 5.75, "DYN_RES": 0.31, "BLIP_SIGMA": 3.825, "CAM_DELAY_GAIN": 0.05, "EURO_FMIN": 0.0995, "EURO_BETA": 0.29698484809834996, "Q_BW": 0.01767766952966368, "CONF_POW": 0.0, "CMAP_GAIN": 0.05, "Q_ACC_A": 6000.0, "R_ACC0_ACC": 5.7, "DEV_G_ACC": 0.084, "DEAD_G_ACC": 0.0275, "BLIP_SIGMA_ACC": 3.0, "EURO_FMIN_ACC": 0.0995, "EURO_BETA_ACC": 0.21249999999999997}
+saved /Users/luqman_ahmed/Desktop/MakeUC2026/tuning_clone/tuning/best_combo.json

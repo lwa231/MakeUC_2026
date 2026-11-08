@@ -17,16 +17,16 @@ import math
 # train seeds) and checked on held-out seeds; see tuning/TUNING_NOTES.md.
 W_DEFAULT = 0.75      # camera share of trust (0 = accelerometers only, 1 = camera only): camera leads
 RESP_DEFAULT = 0.5    # responsiveness 0..1: higher follows faster, lower is smoother at rest
-R_ACC0 = 1.7          # (tuned) accel knee variance per 100 Hz sample at w = 0 (deg^2)
-R_CAM0 = 11.0         # (tuned) floor of the camera variance per frame at w = 1 (deg^2); also learned (cam_var)
-DEV_G = 0.2           # (tuned) accel R grows by (dev/DEV_G)^2, dev = ||a| - 1 g| beyond DEAD_G and the swing
+R_ACC0 = 4.81          # (tuned) accel knee variance per 100 Hz sample at w = 0 (deg^2)
+R_CAM0 = 0.42         # (tuned) floor of the camera variance per frame at w = 1 (deg^2); also learned (cam_var)
+DEV_G = 0.10           # (tuned) accel R grows by (dev/DEV_G)^2, dev = ||a| - 1 g| beyond DEAD_G and the swing
 DEAD_G = 0.0          # (tuned) |a| error ignored as noise / zero-g offset (g)
-Q_B = 0.03            # random walk of b while the camera is fused (deg^2/s): strap slip (tuning/ slip scenario)
-Q_BW = 0.0            # ... plus this per degree of knee travel (deg^2/deg): board error changes with the angle
-Q_J0 = 1.2e6          # (tuned) white jerk density at resp = 0.5 (deg^2/s^5)
-ALPHA_TAU = 0.075     # (tuned) angular acceleration decorrelates over this time (s)
+Q_B = 0.015            # random walk of b while the camera is fused (deg^2/s): strap slip (tuning/ slip scenario)
+Q_BW = 0.018            # ... plus this per degree of knee travel (deg^2/deg): board error changes with the angle
+Q_J0 = 2.4e+06          # (tuned) white jerk density at resp = 0.5 (deg^2/s^5)
+ALPHA_TAU = 0.106     # (tuned) angular acceleration decorrelates over this time (s)
 Q_CAM_A = 3000.0      # camera only: white angular-acceleration density at resp = 0.5 (deg^2/s^3)
-GATE = 3.0            # (tuned) reject camera frames whose innovation exceeds this many sigma
+GATE = 5.75            # (tuned) reject camera frames whose innovation exceeds this many sigma
 RELOCK_N = 3          # ... unless this many rejected frames
 RELOCK_S = 0.4        # ... within this long
 RELOCK_SD = 3.0       # ... lie on a line to within this (deg): then the camera is right, relock to it
@@ -36,7 +36,7 @@ COAST_TAU = 0.2       # while coasting omega decays with this time constant (s)
 CAM_STALE_S = 0.3     # camera-only: no accepted frame for this long also coasts (s)
 CAM_OK_S = 0.5        # cam_ok while a frame was accepted this recently (s)
 EURO_FMIN = (0.033, 0.133)  # (tuned) display (One Euro) cutoff at rest: a + b * resp (Hz)
-EURO_BETA = (0.035, 0.14)   # (tuned) ... plus this (a + b * resp, Hz) per deg/s of speed
+EURO_BETA = (0.099, 0.396)   # (tuned) ... plus this (a + b * resp, Hz) per deg/s of speed
 # Without camera frames (no webcam, markers lost, src = accel) the accelerometers are on their own and want
 # a calmer model and display than when the camera steadies the estimate:
 # a constant-velocity model like the original (pre-rework) filter, which tuning/ablate_accel.py found best
@@ -48,14 +48,15 @@ BLIP_SIGMA_ACC = 3.0  # jolt threshold, no camera
 SWING_ACC = 0         # swing model without camera: 0 off, 1 centripetal only (omega^2; alpha is not estimated)
 EURO_FMIN_ACC = (0.033, 0.133)  # (tuned) display cutoff at rest, no camera (Hz)
 EURO_BETA_ACC = (0.071, 0.283)  # (tuned) display speed slope, no camera
+THETA_LIM = (-90.0, 200.0)               # hard knee range of the state (deg)
 OMEGA_LIM, ALPHA_LIM = 1500.0, 30000.0   # hard state limits (deg/s, deg/s^2): a guard, never reached by a leg
 SPEED_DEAD = 5.0      # display: speeds below this (deg/s) count as rest noise
-BLIP_SIGMA = 2.2      # (tuned) accel samples further than this from the prediction are jolts: down-weighted
+BLIP_SIGMA = 3.83      # (tuned) accel samples further than this from the prediction are jolts: down-weighted
 G = 9.80665           # m/s^2
 R_SHANK_M = 0.118     # hinge -> shank sensor pocket centre (hardware/brace/brace.py sensor_pos)
 OMEGA_MAX = 600.0     # the swing model trusts at most this knee speed (deg/s) ...
 ALPHA_MAX = 4000.0    # ... and acceleration (deg/s^2); a brisk 90 deg rep in 0.5 s peaks near 2100
-DYN_RES = 0.06        # (tuned) share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
+DYN_RES = 0.31        # (tuned) share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
 CAM_DELAY0 = 0.04     # first guess of exposure -> t_cap (s); learned while the knee moves
 CAM_DELAY_MAX = 0.25
 CAM_DELAY_GAIN = 0.05 # learning rate of the camera delay (per frame in motion)
@@ -63,10 +64,10 @@ CAM_DELAY_STEP = 0.06 # one frame's delay error estimate is clipped to this (s)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
-CMAP_GAIN = 0.02      # learning rate of the accelerometer error map (per still camera frame); 0 = off
+CMAP_GAIN = 0.050      # learning rate of the accelerometer error map (per still camera frame); 0 = off
 CMAP_SPEED = 30.0     # ... learned only from frames slower than this (deg/s)
 CMAP_MAX_ERR = 15.0   # ... and only when accel and camera disagree by less than this (deg)
-CONF_POW = 2.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
+CONF_POW = 0.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
 CAM_H = (1.0, 0.0, 0.0, 0.0)  # camera row: camera = theta (accel = theta + b + swing, see _accel_z)
 N = 4
 
@@ -119,6 +120,15 @@ def _predict(x, P, dt, q, qb, coast):
                 Pn[i][j] += q * Q[i][j]
     Pn[3][3] += qb * dt
     return xn, Pn
+
+
+def _guard(x):
+    """Keep the state physical whatever the inputs: a knee lives in THETA_LIM, and omega / alpha stay below
+    OMEGA_LIM / ALPHA_LIM (never reached by a real leg). Stops wrap-around and runaway in every mode."""
+    if (THETA_LIM[0] <= x[0] <= THETA_LIM[1] and abs(x[1]) <= OMEGA_LIM and abs(x[2]) <= ALPHA_LIM):
+        return x
+    return [max(THETA_LIM[0], min(THETA_LIM[1], x[0])), max(-OMEGA_LIM, min(OMEGA_LIM, x[1])),
+            max(-ALPHA_LIM, min(ALPHA_LIM, x[2])), x[3]]
 
 
 def _innovation(x, P, h, z, r):
@@ -270,11 +280,10 @@ class KneeFilter:
                 if nu * nu > bs * bs * s:             # jolt, not a real angle change (Huber)
                     ph, s, nu = _innovation(x, P, h, zl, r * nu * nu / (bs * bs * s))
                 x, P = _update(x, P, ph, s, nu)
-                if abs(x[1]) > OMEGA_LIM or abs(x[2]) > ALPHA_LIM:    # guard: never let the state run away
-                    x = [x[0], max(-OMEGA_LIM, min(OMEGA_LIM, x[1])), max(-ALPHA_LIM, min(ALPHA_LIM, x[2])), x[3]]
         elif e[3] is not None:
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + wrap(e[2] - x[0]), e[3])
             x, P = _update(x, P, ph, s, nu)
+        x = _guard(x)
         e[4:] = [x, P, t if kind == 0 else prev[6], z]
         return x, P
 
@@ -355,7 +364,7 @@ class KneeFilter:
             # re-derive b from the accel reading at that time.
             theta, omega = fit
             z_acc = H[i - 1][7] if H[i - 1][7] is not None else self.z_acc
-            x = [theta, omega, 0.0, (z_acc - theta - self._cmap(theta)[0]) if self.w_eff < 1.0 else x[3]]
+            x = _guard([theta, omega, 0.0, (z_acc - theta - self._cmap(theta)[0]) if self.w_eff < 1.0 else x[3]])
             P = self._p0(r, r + R_ACC0)
             P[1][1], P[2][2] = 30.0 ** 2, 300.0 ** 2
             e[1], e[3] = 2, None                          # a reset entry: replays keep it
@@ -382,6 +391,7 @@ class KneeFilter:
                     self.cmap = [c + k_ * f for c, f in zip(self.cmap, ph_)]
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
+            x = _guard(x)
             e[4:] = [x, P, H[i - 1][6], H[i - 1][7]]
             self.rej = []
         self.t_cam = max(self.t_cam, t)
