@@ -71,6 +71,7 @@ CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
 CMAP_GAIN = 0.050      # learning rate of the accelerometer error map (per still camera frame); 0 = off
+CMAP_TERMS = 4        # ... using sin/cos of theta (2) or of theta and 2 theta (4)
 CMAP_SPEED = 30.0     # ... learned only from frames slower than this (deg/s)
 CMAP_MAX_ERR = 15.0   # ... and only when accel and camera disagree by less than this (deg)
 CONF_POW = 0.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
@@ -392,9 +393,9 @@ class KneeFilter:
                 err = (z_acc - x[3] - self._cmap(th)[0]) - th
                 if abs(err) < CMAP_MAX_ERR:
                     a = math.radians(th)
-                    ph_ = (math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a))
+                    ph_ = (math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a))[:int(CMAP_TERMS)]
                     k_ = CMAP_GAIN * err / (sum(f * f for f in ph_) + 1e-6)
-                    self.cmap = [c + k_ * f for c, f in zip(self.cmap, ph_)]
+                    self.cmap = [c + k_ * f for c, f in zip(self.cmap, ph_)] + self.cmap[len(ph_):]
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
             x = _guard(x)

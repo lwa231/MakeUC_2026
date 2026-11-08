@@ -37,7 +37,8 @@ SCEN = {
     "latestamp": ("default", dict(cam_stamp=(0.08, 0.12))),
     "fastbad": ("fast", dict(cam_noise=2.5, cam_drop=0.15, cam_lost_rate=1 / 8.0, cam_outlier=0.03)),
     "nocam": ("default", dict(cam_drop=1.0)),
-    "slip": ("default", dict(slip_deg=6.0, slip_t=15.0)),   # the shank strap slips 6 deg mid-session          # webcam missing: what most demos without one see
+    "slip": ("default", dict(slip_deg=6.0, slip_t=15.0)),   # the shank strap slips 6 deg mid-session
+    "longloss": ("default", dict(cam_lost_rate=1 / 12.0, cam_lost=(6.0, 10.0))),   # camera gone for 6-10 s          # webcam missing: what most demos without one see
 }
 TRAIN, TEST = (1, 2, 3), (11, 12, 13)
 DURATION = 40.0
