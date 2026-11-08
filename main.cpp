@@ -19,7 +19,7 @@
 //
 // Angle source, in priority order:
 //   LIVE        from the helper process
-//   AUTO DEMO   built-in sweep until live data arrives
+//   AUTO DEMO   built-in sweep, only when turned on with SPACE (off by default: no data = no motion)
 //   MANUAL      UP/DOWN keys (after turning the demo off with SPACE)
 // If live data stops for >0.5 s the last angle is held ("SIGNAL LOST").
 //
@@ -371,7 +371,7 @@ struct LegState {
 };
 
 static LegState g_leg;
-static bool g_autoSweep = true;
+static bool g_autoSweep = false;   // only real data moves the leg; SPACE turns the demo sweep on
 static float g_camYawDeg = 0.0f;
 static int g_fbWidth = 1000, g_fbHeight = 700;
 #ifdef _WIN32
@@ -747,9 +747,10 @@ int main(int argc, char** argv) {
             g_leg.kneeDeg = 45.0f * (1.0f + std::cos((float)sweepT * 2.0f * kPi / 4.0f));
             source = "AUTO DEMO";
         } else {
-            if (held(GLFW_KEY_UP))   g_leg.kneeDeg += 60.0f * dt;
-            if (held(GLFW_KEY_DOWN)) g_leg.kneeDeg -= 60.0f * dt;
-            source = "MANUAL";
+            const bool up = held(GLFW_KEY_UP), down = held(GLFW_KEY_DOWN);
+            if (up)   g_leg.kneeDeg += 60.0f * dt;
+            if (down) g_leg.kneeDeg -= 60.0f * dt;
+            source = (up || down) ? "MANUAL" : "WAITING FOR SENSOR DATA";
         }
         clampLeg();
 
