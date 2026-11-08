@@ -1,0 +1,9 @@
+# Python deps for the live pipeline (serial_bridge.py / camera_origin.py / live/run_live.py)
+# Install with:  python3 -m pip install -r requirements.txt
+
+# Required for real hardware (Arduino over USB serial).
+pyserial>=3.5
+
+# OPTIONAL - only for `run_live.py --camera` (ArUco markers via camera_origin.py).
+# Needs the "contrib" build (it provides cv2.aruco). Uncomment to install:
+# opencv-contrib-python>=4.8

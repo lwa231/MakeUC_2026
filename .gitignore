@@ -7,3 +7,6 @@ include/GLMF
 include/glm
 .vscode/settings.json
 .vscode/c_cpp_properties.json
+__pycache__/
+live/third_party/
+live/leg_config.json
