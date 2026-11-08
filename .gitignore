@@ -10,3 +10,5 @@ include/glm
 __pycache__/
 live/third_party/
 live/leg_config.json
+live/brace_cal.json
+live/leg_cal.json

@@ -10,8 +10,10 @@
   of the 3 markers are seen: KNEE #1, THIGH END #0, SHIN END #2.
 * Sensor stream indicator (reads STATE.json.stats written by leg_filter.py).
 * Small fix chips if a leg still looks wrong: Invert bend / Flip shin 180 / Mirror camera.
+* Fusion card: camera share (w), responsiveness, source (Fused / Sensors / Camera), Calibrate,
+  Anchor, Bench check and Zero, plus leg_filter's calibration status. Writes STATE.json.tune
+  {w, resp, src, zero_seq, cal_seq, cal_mode, cal_anchor_deg}; leg_filter polls it.
 Per-leg chip settings and the last leg are remembered in live/leg_config.json.
-(Planned, not built: Start/Stop, rep counter, more stats.)
 """
 import argparse
 import json
@@ -21,6 +23,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from knee_estimator import RESP_DEFAULT, W_DEFAULT  # noqa: E402
 CONFIG = os.path.join(HERE, "leg_config.json")
 DEFAULTS = {"left": {"invert": False, "rot180": False},
             "right": {"invert": True, "rot180": False}}   # right = mirrored brace
@@ -69,8 +73,33 @@ def initial_state(path, leg=None):
     """Write the starting state (used by run_live.py before the viewer opens). Returns the leg."""
     cfg = load_cfg()
     leg = leg or cfg["last_leg"]
-    write_state(path, leg, cfg[leg]["invert"], cfg[leg]["rot180"], cfg["assist"])
+    write_state(path, leg, cfg[leg]["invert"], cfg[leg]["rot180"])
     return leg
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def update_tune(path, bump=None, **changes):
+    """Read-modify-write STATE.json.tune atomically; bump names a counter to increment."""
+    d = read_json(path)
+    d.update(changes)
+    if bump:
+        d[bump] = int(d.get(bump) or 0) + 1
+    tmp = path + ".tmp.panel"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return d
 
 
 # ------------------------------------------------------------------ camera ----
@@ -129,7 +158,7 @@ def main():
     cfg = load_cfg()
     leg = a.leg or cfg["last_leg"]
     st = {"leg": leg, "invert": cfg[leg]["invert"], "rot180": cfg[leg]["rot180"], "mirror": cfg["mirror_cam"],
-          "assist": cfg["assist"]}
+          "assist": True}         # the Fusion card's source buttons replace the old assist chip
 
     root = tk.Tk()
     root.title("Brace Tracker")
@@ -204,12 +233,92 @@ def main():
         c.pack(side="left", padx=(0, 6))
         c.bind("<Button-1>", lambda e, k=key: toggle(k))
         fchips[key] = c
-    make_fix("assist", "Camera assist")
     make_fix("invert", "Invert bend")
     make_fix("rot180", "Flip shin 180°")
     make_fix("mirror", "Mirror camera")
-    label(root, "After changing the leg, hold it straight and press Z in the 3D window.", 10, fg=MUTED
-          ).pack(padx=18, pady=(2, 14), anchor="w")
+
+    # fusion card: how much to trust the camera vs the accelerometers, and calibration
+    tune_path = a.state + ".tune"
+    tune = read_json(tune_path)
+    tune = {"w": float(tune.get("w", W_DEFAULT)), "resp": float(tune.get("resp", RESP_DEFAULT)),
+            "src": tune.get("src") or "fused", "t_write": 0.0}
+    fc = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=OFF)
+    fc.pack(fill="x", padx=18, pady=(4, 10))
+    fh = tk.Frame(fc, bg=CARD)
+    fh.pack(fill="x", padx=12, pady=(10, 4))
+    label(fh, "FUSION", 12, True, bg=CARD).pack(side="left")
+    cal_chip = label(fh, "", 10, True, fg="white", bg=OFF, padx=8, pady=2)
+    cal_chip.pack(side="right")
+
+    def set_tune(key, value):
+        if tune[key] != value:
+            tune[key], tune["t_write"] = value, time.monotonic()
+            update_tune(tune_path, **{key: value})
+        refresh_fusion()
+
+    def on_slide(key, v):
+        if abs(v - tune[key]) > 0.024:      # ignore the echo of stats_tick's own set()
+            set_tune(key, round(v, 2))
+
+    def slider(key, left, right):
+        row = tk.Frame(fc, bg=CARD)
+        row.pack(fill="x", padx=12, pady=2)
+        title = label(row, "", 11, fg=TEXT, bg=CARD, width=20, anchor="w")
+        title.pack(side="left")
+        label(row, left, 10, fg=MUTED, bg=CARD).pack(side="left")
+        sc = tk.Scale(row, from_=0.0, to=1.0, resolution=0.05, orient="horizontal", showvalue=False,
+                      length=220, bg=CARD, troughcolor=OFF, activebackground=BLUE, highlightthickness=0,
+                      bd=0, sliderrelief="flat", command=lambda v: on_slide(key, float(v)))
+        sc.set(tune[key])
+        sc.pack(side="left", padx=6)
+        label(row, right, 10, fg=MUTED, bg=CARD).pack(side="left")
+        return sc, title
+    w_scale, w_title = slider("w", "sensors", "camera")
+    r_scale, r_title = slider("resp", "smooth", "responsive")
+
+    def chip(parent, text, cmd, side="left"):
+        c = tk.Label(parent, text=text, font=(FONT, 11, "bold"), padx=10, pady=4, cursor="hand2", bg=OFF, fg=TEXT)
+        c.pack(side=side, padx=(0, 6))
+        c.bind("<Button-1>", lambda e: cmd())
+        return c
+    srow = tk.Frame(fc, bg=CARD)
+    srow.pack(fill="x", padx=12, pady=(6, 4))
+    label(srow, "Source", 11, fg=MUTED, bg=CARD, width=8, anchor="w").pack(side="left")
+    src_chips = {k: chip(srow, text, lambda k=k: set_tune("src", k))
+                 for k, text in (("fused", "Fused"), ("accel", "Sensors"), ("camera", "Camera"))}
+
+    def calibrate(mode):
+        extra = {}
+        if mode == "anchor":
+            try:
+                extra["cal_anchor_deg"] = float(anchor_var.get())
+            except ValueError:
+                return cal_line.config(text="Type the measured knee angle (deg) first, then press Anchor.", fg=AMBER)
+        update_tune(tune_path, bump="cal_seq", cal_mode=mode, **extra)
+        cal_line.config(text="Starting calibration…", fg=AMBER)
+    brow = tk.Frame(fc, bg=CARD)
+    brow.pack(fill="x", padx=12, pady=(4, 4))
+    chip(brow, "Calibrate", lambda: calibrate("hang")).config(bg=BLUE, fg="white")
+    chip(brow, "Anchor", lambda: calibrate("anchor"))
+    anchor_var = tk.StringVar()
+    tk.Entry(brow, textvariable=anchor_var, width=4, font=(FONT, 11), bg=OFF, fg=TEXT, insertbackground=TEXT,
+             relief="flat").pack(side="left")
+    label(brow, "deg", 11, fg=MUTED, bg=CARD).pack(side="left", padx=(3, 10))
+    chip(brow, "Bench check", lambda: calibrate("bench"))
+    chip(brow, "Zero (straight)", lambda: update_tune(tune_path, bump="zero_seq"), side="right")
+    cal_line = label(fc, "Calibrate: sit, let the shin hang, then follow the prompts (~35 s).", 11, fg=MUTED,
+                     bg=CARD, wraplength=W - 70, justify="left", anchor="w")
+    cal_line.pack(fill="x", padx=12, pady=(4, 10))
+
+    def refresh_fusion():
+        w_title.config(text="camera share %d%%" % round(100 * tune["w"]))
+        r_title.config(text="responsiveness %.2f" % tune["resp"])
+        for k, c in src_chips.items():
+            on = tune["src"] == k
+            c.config(bg=BLUE if on else OFF, fg="white" if on else MUTED)
+    refresh_fusion()
+    label(root, "Zero only when the leg is truly straight; Calibrate measures your extension too.", 10,
+          fg=MUTED).pack(padx=18, pady=(0, 14), anchor="w")
 
     # ---- behaviour
     def refresh_widgets():
@@ -221,11 +330,10 @@ def main():
             c.config(bg=BLUE if on else OFF, fg="white" if on else MUTED)
 
     def push():
-        write_state(a.state, st["leg"], st["invert"], st["rot180"], st["assist"])
+        write_state(a.state, st["leg"], st["invert"], st["rot180"])
         cfg["last_leg"] = st["leg"]
         cfg[st["leg"]] = {"invert": st["invert"], "rot180": st["rot180"]}
         cfg["mirror_cam"] = st["mirror"]
-        cfg["assist"] = st["assist"]
         save_cfg(cfg)
         if tracker is not None:
             tracker.flip_x = st["mirror"]
@@ -242,7 +350,7 @@ def main():
 
     # ---- camera
     tracker = None
-    cam = {"idx": a.cam, "photo": None, "next_open": 0.0, "err": None, "fail": 0}
+    cam = {"idx": a.cam, "photo": None, "next_open": 0.0, "err": None, "fail": 0, "seq": 0}
     use_cam = not a.no_camera
 
     def open_camera():
@@ -276,8 +384,10 @@ def main():
 
     def publish_cam(fix):
         """Hand the camera knee angle to leg_filter.py (it fuses it with the accelerometers)."""
+        cam["seq"] += 1             # t_cap: capture time on the monotonic clock, so late frames line up
         d = {"knee": None if fix is None else fix.camera_knee_deg,
-             "conf": 0.0 if fix is None else float(fix.confidence), "wall": time.time()}
+             "conf": 0.0 if fix is None else float(fix.confidence), "wall": time.time(),
+             "t_cap": fix.t if fix is not None and fix.t else time.monotonic(), "seq": cam["seq"]}
         try:
             with open(a.state + ".cam.tmp", "w") as f:
                 json.dump(d, f)
@@ -335,31 +445,32 @@ def main():
         readout.config(text="   ".join(bits))
         root.after(15, cam_tick)
 
-    # ---- sensor stream indicator
+    # ---- leg_filter readout (STATE.json.stats, 2 Hz)
     def stats_tick():
-        txt, col = "no sensor data", RED
-        try:
-            with open(a.state + ".stats") as f:
-                d = json.load(f)
-            if time.time() - d.get("wall", 0) < 1.5 and d.get("rate", 0) > 5:
-                txt, col = "sensors %d Hz" % round(d["rate"]), GREEN
-        except (OSError, ValueError):
-            pass
-        stream_txt.config(text=txt)
-        stream_dot.config(fg=col)
-        ftxt, fcol = "assist off", MUTED
-        if st["assist"]:
-            ftxt, fcol = "assist: waiting for camera", AMBER
-            try:
-                with open(a.state + ".stats") as f:
-                    d = json.load(f)
-                if time.time() - d.get("wall", 0) < 1.5 and d.get("fusion") in ("locked", "holding"):
-                    off = d.get("offset_deg")
-                    ftxt = "assist: %s  %+.0f\u00b0" % ("LOCKED" if d["fusion"] == "locked" else "holding", off or 0)
-                    fcol = GREEN if d["fusion"] == "locked" else AMBER
-            except (OSError, ValueError):
-                pass
+        d = read_json(a.state + ".stats")
+        if time.time() - d.get("wall", 0) > 1.5:
+            d = {}
+        live = d.get("rate", 0) > 5
+        stream_txt.config(text="sensors %d Hz" % round(d["rate"]) if live else "no sensor data")
+        stream_dot.config(fg=GREEN if live else RED)
+        ftxt, fcol = {"locked": ("camera fused", GREEN), "waiting": ("camera: waiting", AMBER),
+                      "off": ("camera not used", MUTED)}.get(d.get("fusion"), ("", MUTED))
         fusion_lbl.config(text=ftxt, fg=fcol)
+        cal = d.get("cal") or {}
+        cal_chip.config(text="CALIBRATED" if cal.get("calibrated") else "NOT CALIBRATED",
+                        bg=GREEN if cal.get("calibrated") else AMBER)
+        if cal.get("state") not in (None, "idle"):
+            busy = cal["state"] not in ("done", "failed")
+            pct = "  (%d%%)" % round(100 * cal.get("progress", 0)) if busy else ""
+            cal_line.config(text=(cal.get("prompt") or "") + pct,
+                            fg=AMBER if busy else GREEN if cal["state"] == "done" else RED)
+        if d and time.monotonic() - tune["t_write"] > 1.0:   # follow the viewer's keys too
+            for key in ("w", "resp", "src"):
+                if key in d:
+                    tune[key] = d[key]
+            w_scale.set(tune["w"])
+            r_scale.set(tune["resp"])
+            refresh_fusion()
         root.after(500, stats_tick)
 
     push()

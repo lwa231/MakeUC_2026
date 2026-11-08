@@ -1,41 +1,16 @@
 #!/usr/bin/env python3
-"""leg_filter.py - sits between serial_bridge.py (or fake_pi.py) and the viewer.
+"""leg_filter.py - between the data source and the viewer: sensor lines in, knee angle out.
 
-    leg_filter.py --state STATE.json -- <data source command ...>
+    leg_filter.py [--state PATH] [--auto-zero SECS] [--no-cal] -- <source command ...>
 
-main.cpp is not touched. Its axis map is compile-time and it only knows the two
-accelerometers, so this filter rewrites the sample lines it receives.
-
-1) Leg choice (STATE.json, re-read ~10x/s, written by leg_panel.py / run_live.py):
-     {"leg", "invert": bool, "rot180": bool, "assist": bool}
-   invert : negate the sagittal axis (x) of BOTH sensors -> knee bend direction flips
-   rot180 : negate x and z of the SHANK sensor -> shin tilt +180 deg
-
-2) CAMERA ASSIST (the camera helps the motion sensors). leg_panel.py publishes the
-   camera's knee angle (from the ArUco markers) to STATE.json.cam. Accelerometer-only
-   knee angle has an unknown zero offset, tilt drift and 2.7 deg steps; the camera
-   knee angle is absolute but slow/laggy. A complementary filter combines them:
-
-        knee_out = knee_accel + offset,   offset tracks (knee_camera - knee_accel)
-                                          with a ~0.4 s time constant
-
-   i.e. slow motion and the zero follow the camera, quick motion follows the sensors.
-   The correction is applied by rotating the shank accelerometer vector in the
-   sagittal (x,z) plane, so main.cpp's own math (tilt, low-pass, knee = shank-thigh,
-   quality from |a|) is unchanged and simply sees the corrected angle. The camera
-   also fixes the bend direction automatically (accelerometer sign vs camera sign are
-   correlated while you move) and the camera's own mirror sign (flexion is >= 0).
-   If the camera drops out the last offset is held. Turn off with assist=false.
-
-Line format in/out: t_ms,tx,ty,tz,sx,sy,sz[,thigh_px,thigh_py,shank_px,shank_py]
-
-Also: emits a blank heartbeat line when the source is silent (the viewer ignores blank
-lines) so the viewer can always quit; stops the source when the viewer closes the pipe;
-writes STATE.json.stats {rate, wall, fusion, offset_deg, ...} for the panel.
+Per sample (`t_ms,tx,ty,tz,sx,sy,sz[,...]`, g): bench correction -> leg mapping (calibration sign, or
+STATE invert/rot180 while uncalibrated) -> knee_estimator.KneeFilter, fused with STATE.cam frames.
+STATE.tune (panel) and STATE.viewer (viewer keys) set w, resp, src; a rise in zero_seq / cal_seq runs
+a quick zero / a calibration. stdout: `K,<t_ms>,<theta>,<omega>,<flags>,<w>` per sample (50 Hz when
+coasting; flags 1 camera fused, 2 coasting, 4 calibrating, 8 uncalibrated, 16 reset), `M,<level>,<text>`
+messages and blank heartbeat lines. STATE.stats (2 Hz) feeds the panel. Standard library only.
 """
-import json
-import math
-from collections import deque
+import argparse
 import os
 import select
 import signal
@@ -43,263 +18,264 @@ import subprocess
 import sys
 import time
 
-KSAG, KVERT = 0, 2          # main.cpp kSagAxis / kVertAxis (x / z)
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import calibrate  # noqa: E402
+from knee_estimator import KneeFilter, wrap  # noqa: E402
+
+BENCH_PATH = os.path.join(HERE, "brace_cal.json")   # bench check result (once per brace)
+LEG_CAL_PATH = os.path.join(HERE, "leg_cal.json")   # {leg: hang/anchor result}
+SERIAL_LAT_S = 0.008    # best-case sample-to-arrival delay (I2C reads + one 115200-baud line)
+CLOCK_CREEP = 0.005     # s per s the device-to-host clock offset may rise (crystal skew)
+CAM_LATENCY_S = 0.08    # capture-to-file delay assumed for camera frames without t_cap
+CAM_MIN_CONF = 0.5      # camera frames below this confidence are ignored
+COAST_AFTER_S = 0.1     # accel silence before coasting output starts (USB stalls are shorter)
+CAL_SILENT_S = 15.0     # a calibration gives up after this long without sensor data
 
 
-def wrap(a):
-    return (a + 180.0) % 360.0 - 180.0
-
-
-def read_json(path):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
-class Fusion:
-    TAU_OFFSET = 0.6      # s: how fast the offset follows the camera
-    CAM_LAG = 0.12        # s: typical webcam latency; the accelerometer angle is compared with the
-                          #    camera angle from this long ago so motion does not bias the offset
-    RC = 1.0 / (2.0 * math.pi * 5.0)   # same 5 Hz low-pass as main.cpp
-    CAM_MAX_AGE = 0.25    # s
-    TAU_STAT = 6.0        # s window for the sign decision
-
-    def __init__(self):
-        self.y = None          # low-passed [tx,ty,tz,sx,sy,sz]
-        self.o = None          # offset (deg), None until the first camera lock
-        self.s = 1.0           # accelerometer sign relative to the camera
-        self.cs = 1.0          # camera sign (so that flexion is >= 0)
-        self.cmean = 0.0
-        self.stat = None       # EW means/variances for the correlation
-        self.last_t = None
-        self.cam = None
-        self.fresh = False
-        self.status = "waiting"
-        self.hist = deque()    # (t_ms, a_lp) for the latency compensation
-        self.rej = 0
-
-    def set_cam(self, d):
-        self.cam = d
-
-    def _cam_value(self):
-        d = self.cam
-        if not d or d.get("knee") is None:
-            return None
-        if time.time() - d.get("wall", 0) > self.CAM_MAX_AGE or d.get("conf", 0) < 0.5:
-            return None
-        return float(d["knee"])
-
-    def process(self, v, t_ms):
-        """v: 6 floats (g). Returns corrected 6 floats."""
-        dt = 0.01
-        if self.last_t is not None:
-            d = (t_ms - self.last_t) / 1000.0
-            if 0.002 < d < 0.05:
-                dt = d
-        self.last_t = t_ms
-        if self.y is None:
-            self.y = list(v)
+class LegFilter:
+    def __init__(self, state_path, auto_zero, use_saved):
+        self.paths = {k: state_path + k for k in ("", ".cam", ".tune", ".viewer", ".stats")}
+        self.auto_zero, self.use_saved = auto_zero, use_saved
+        self.bench = calibrate.load(BENCH_PATH) if use_saved else None
+        self.st, self.leg, self.leg_cal, self.mapping = {}, None, None, None
+        self.kf, self.reset, self.out, self.t_out = KneeFilter(), False, [], 0.0   # t_out: last K line
+        self.off = self.t_last = self.t_arr = self.t0 = None       # device clock -> host clock
+        self.cal, self.last_cal, self.cal_msg, self.cal_t = None, None, "", 0.0   # running / last CalSession
+        self.cam_mtime, self.cam_key, self.cam_mean, self.cam_sign = None, None, 0.0, 1.0
+        self.n_acc = self.n_cam = 0
+        # (file, key) -> last zero_seq / cal_seq seen; whatever the files hold at startup is old news
+        self.seqs = {(p, k): int((calibrate.load(p) or {}).get(k) or 0)
+                     for p in (self.paths[".tune"], self.paths[".viewer"]) for k in ("zero_seq", "cal_seq")}
+        self.poll_files()
+        if self.leg_cal:
+            self.auto_zero = 0.0        # calibrated: a quick zero would throw the deficit away
         else:
-            al = dt / (self.RC + dt)
-            for i in range(6):
-                self.y[i] += al * (v[i] - self.y[i])
+            self.say("info", "Not calibrated: press C (or Calibrate in the panel) for Hang and Straighten.")
 
-        def tilt(a, base):
-            return math.degrees(math.atan2(a[base + KSAG], a[base + KVERT]))
-        a_inst = wrap(tilt(v, 3) - tilt(v, 0))
-        a_lp = wrap(tilt(self.y, 3) - tilt(self.y, 0))
+    def say(self, level, text):
+        self.out.append("M,%s,%s\n" % (level, " ".join(str(text).split())[:150]))
 
-        self.hist.append((t_ms, a_lp))
-        while len(self.hist) > 2 and self.hist[1][0] <= t_ms - 1000.0 * self.CAM_LAG:
-            self.hist.popleft()
-        a_cmp = self.hist[0][1]                  # a_lp about CAM_LAG ago (matches the camera frame)
+    def emit(self, t, theta, omega, coast=False):
+        flags = ((1 if self.kf.cam_ok else 0) | (2 if coast else 0) | (4 if self.cal else 0)
+                 | (0 if self.kf.calibrated else 8) | (16 if self.reset else 0))
+        self.reset, self.t_out = False, max(t, self.t_out)
+        self.out.append("K,%.1f,%.2f,%.1f,%d,%.2f\n" % (self.t_out * 1000.0, theta, omega, flags, self.kf.w))
 
-        c = self._cam_value()
-        self.fresh = c is not None
-        if c is not None:
-            # camera sign: flexion should be >= 0 (never hyperextends past ~8 deg)
-            self.cmean += dt / 3.0 * (c - self.cmean)
-            ncs = self.cs
-            if self.cmean > 8.0:
-                ncs = 1.0
-            elif self.cmean < -8.0:
-                ncs = -1.0
-            if ncs != self.cs:
-                self.cs, self.o, self.stat = ncs, None, None
-            c *= self.cs
-            # accelerometer sign: correlate accel knee with camera knee while moving
-            if self.stat is None:
-                self.stat = [a_cmp, c, 0.0, 0.0, 0.0]            # ma, mc, cov, va, vc
+    def apply_mapping(self, force=False):
+        """Calibrated: the calibration's sign and k. Otherwise STATE invert/rot180, k unknown."""
+        if self.leg_cal:
+            inv, k = self.leg_cal["sign"] < 0, float(self.leg_cal["k_deg"])
+            rot = abs(k) > 90.0         # shank mounted upside down: rotate it so k stays small
+            k = wrap(k + 180.0) if rot else k
+        else:
+            inv, rot, k = bool(self.st.get("invert")), bool(self.st.get("rot180")), None
+        if force or (inv, rot, k) != self.mapping:
+            self.mapping, old = (inv, rot, k), self.kf
+            self.kf = KneeFilter(old.w, old.resp)     # the raw angle jumped: start afresh
+            self.kf.set(src=old.src)
+            if k is not None:
+                self.kf.set_reference(k)
+            self.reset = True
+
+    def on_line(self, line, now):
+        if line.startswith("#"):
+            return sys.stderr.write(line + "\n")
+        f = line.split(",")
+        try:
+            t_dev, raw = float(f[0]) / 1000.0, tuple(float(x) for x in f[1:7])
+            tx, ty, tz, sx, sy, sz = calibrate.apply_bench(self.bench, raw)
+        except ValueError:
+            return                      # not a sample line
+        # Device clock -> host clock: lower envelope of (arrival - t_dev), so samples keep their
+        # device spacing through USB bursts; it creeps up for crystal skew and re-anchors on a reset.
+        d = now - t_dev
+        self.off = d if self.off is None or d > self.off + 0.5 else \
+            min(self.off + CLOCK_CREEP * (now - self.t_arr), d)
+        t = t_dev + self.off - SERIAL_LAT_S
+        t = t if self.t_last is None else max(t, self.t_last + 1e-4)
+        self.t_last, self.t_arr, self.n_acc = t, now, self.n_acc + 1
+        self.t0 = t if self.t0 is None else self.t0
+        inv, rot, _ = self.mapping
+        if inv:
+            tx, sx = -tx, -sx
+        if rot:
+            sx, sz = -sx, -sz
+        theta, omega = self.kf.accel(t, (tx, ty, tz, sx, sy, sz))
+        if self.auto_zero and t - self.t0 >= self.auto_zero:
+            self.auto_zero = 0.0
+            if not self.kf.calibrated:
+                self.kf.zero()
+                theta, self.reset = 0.0, True
+        if self.cal:
+            self.feed_cal(t, raw)
+        self.emit(t, theta, omega)
+
+    def poll_cam(self, now):
+        p = self.paths[".cam"]
+        m = os.stat(p).st_mtime_ns if os.path.exists(p) else None    # replaced atomically, never missing
+        if m is None or m == self.cam_mtime:
+            return
+        self.cam_mtime, d = m, calibrate.load(p) or {}
+        key = d.get("seq", d.get("wall"))
+        if key == self.cam_key or d.get("knee") is None or (d.get("conf") or 0.0) < CAM_MIN_CONF:
+            return
+        self.cam_key = key
+        try:
+            knee = float(d["knee"])
+            t_cap = now - CAM_LATENCY_S if d.get("t_cap") is None else float(d["t_cap"])
+        except (TypeError, ValueError):
+            return
+        if not now - 1.0 < t_cap <= now + 0.05:
+            return                      # a stale file, or stamped on another clock
+        # The 2D camera angle's sign depends on the side it films from; flexion is mostly positive.
+        self.cam_mean += 0.01 * (knee - self.cam_mean)
+        if abs(self.cam_mean) > 8.0:
+            self.cam_sign = 1.0 if self.cam_mean > 0 else -1.0
+        self.n_cam += 1
+        self.kf.camera(t_cap, self.cam_sign * knee)
+
+    def poll_files(self):
+        if self.cal and time.monotonic() - self.cal_t > CAL_SILENT_S:
+            self.cal.state, self.cal.prompt = "failed", "Calibration stopped: no sensor data."
+            self.finish_cal()
+        self.st = calibrate.load(self.paths[""]) or self.st
+        leg = self.st.get("leg") or "left"
+        if leg != self.leg:
+            self.leg = leg
+            rec = (calibrate.load(LEG_CAL_PATH) or {}).get(leg) if self.use_saved else None
+            self.leg_cal = rec if calibrate.is_fresh(rec) else None
+            if rec and not self.leg_cal:
+                self.say("warn", "Leg calibration is over 4 h old: press C to recalibrate.")
+        self.apply_mapping()
+        want, kf = {}, self.kf
+        try:                            # oldest file first, so the newer file's values win
+            for _, p, d in sorted((os.stat(p).st_mtime_ns, p, calibrate.load(p) or {}) for p in
+                                  (self.paths[".tune"], self.paths[".viewer"]) if os.path.exists(p)):
+                want.update({k: d[k] for k in ("w", "resp", "src") if d.get(k) is not None})
+                zero_seq, cal_seq = int(d.get("zero_seq") or 0), int(d.get("cal_seq") or 0)
+                if zero_seq > self.seqs[p, "zero_seq"] and kf.x is not None:
+                    kf.zero()
+                    self.reset = True
+                    self.say("info", "Zeroed: this pose reads 0 deg. Press C for a full calibration.")
+                if cal_seq > self.seqs[p, "cal_seq"] and not self.cal:
+                    self.start_cal(d)
+                self.seqs[p, "zero_seq"], self.seqs[p, "cal_seq"] = zero_seq, cal_seq
+            src = want.get("src", kf.src) if self.st.get("assist", True) else "accel"
+            src = src if src in ("fused", "accel", "camera") else kf.src
+            w, resp = float(want.get("w", kf.w)), float(want.get("resp", kf.resp))
+        except (OSError, TypeError, ValueError):
+            return
+        if (w, resp, src) != (kf.w, kf.resp, kf.src):
+            self.reset = self.reset or src != kf.src
+            kf.set(w, resp, src)
+
+    def start_cal(self, d):
+        anchor = d.get("cal_anchor_deg")
+        sign = self.leg_cal["sign"] if self.leg_cal else (-1 if self.st.get("invert") else 1)
+        try:
+            self.cal = calibrate.CalSession(d.get("cal_mode") or "hang",
+                                            None if anchor is None else float(anchor), self.bench, sign)
+        except (ValueError, TypeError, KeyError):
+            return self.say("warn", "Anchor mode needs the measured knee angle in degrees.")
+        self.last_cal, self.cal_msg, self.cal_t = self.cal, "", time.monotonic()
+        self.say("info", self.cal.prompt)
+
+    def feed_cal(self, t, raw):
+        s, self.cal_t = self.cal, time.monotonic()
+        if s.feed(t, raw) and not s.done:
+            self.say(s.level, s.message if s.message and s.message != self.cal_msg else s.prompt)
+            self.cal_msg = s.message
+        elif s.done:
+            self.finish_cal()
+
+    def finish_cal(self):
+        s, self.cal = self.cal, None
+        if s.result:
+            if s.mode == "bench":
+                self.bench, path, saved = s.result, BENCH_PATH, s.result
             else:
-                al = dt / self.TAU_STAT
-                ma, mc, cov, va, vc = self.stat
-                da, dc = a_cmp - ma, c - mc
-                ma += al * da
-                mc += al * dc
-                cov += al * (da * dc - cov)
-                va += al * (da * da - va)
-                vc += al * (dc * dc - vc)
-                self.stat = [ma, mc, cov, va, vc]
-                if va > 25.0 and vc > 25.0:
-                    corr = cov / math.sqrt(va * vc)
-                    if abs(corr) > 0.6:
-                        ns = 1.0 if corr > 0 else -1.0
-                        if ns != self.s:
-                            self.s, self.o = ns, None
-            err = wrap(c - self.s * a_cmp)
-            if self.o is None:
-                self.o = err
-            elif abs(wrap(err - self.o)) < 60.0:             # ignore wild detections ...
-                self.rej = 0
-                self.o = wrap(self.o + dt / (self.TAU_OFFSET + dt) * wrap(err - self.o))
-            else:
-                self.rej += 1
-                if self.rej > 40:                            # ... unless they persist (>0.4 s): re-lock
-                    self.o, self.rej = err, 0
+                self.leg_cal, path = s.result, LEG_CAL_PATH
+                saved = dict(calibrate.load(LEG_CAL_PATH) or {}, **{self.leg: s.result})
+            self.apply_mapping(force=True)
+            try:
+                if self.use_saved:
+                    calibrate.save(path, saved)
+            except OSError as e:
+                self.say("warn", "Could not save the calibration: %s" % e)
+        self.say(s.level, s.prompt)
 
-        if self.o is None:
-            self.status = "waiting"
-            return v
-        self.status = "locked" if self.fresh else "holding"
-        target = wrap(self.s * a_inst + self.o)
-        delta = math.radians(wrap(target - a_inst))
-        cd, sd = math.cos(delta), math.sin(delta)
-        x, z = v[3 + KSAG], v[3 + KVERT]
-        out = list(v)
-        out[3 + KSAG] = x * cd + z * sd                       # rotate the shank vector in the
-        out[3 + KVERT] = z * cd - x * sd                      # sagittal plane: tilt += delta
-        return out
-
-
-def load_state(path, prev, prev_mtime):
-    try:
-        m = os.stat(path).st_mtime
-        if m == prev_mtime:
-            return prev, prev_mtime
-        with open(path) as f:
-            d = json.load(f)
-        return {"invert": bool(d.get("invert")), "rot180": bool(d.get("rot180")),
-                "assist": bool(d.get("assist", True))}, m
-    except (OSError, ValueError):
-        return prev, prev_mtime
-
-
-def transform(line, st, fusion):
-    f = line.rstrip("\r\n").split(",")
-    if len(f) < 7:
-        return line
-    try:
-        if st["invert"]:
-            for i in (1, 4, 7, 9):          # thigh_x, shank_x, thigh_px, shank_px
-                if i < len(f):
-                    f[i] = _neg(f[i])
-        if st["rot180"]:
-            for i in (4, 6):                # shank x and z
-                f[i] = _neg(f[i])
-        if st["assist"] and fusion is not None:
-            v = [float(x) for x in f[1:7]]
-            out = fusion.process(v, float(f[0]))
-            if out is not v:
-                f[1:7] = ["%.4f" % x for x in out]
-        elif not (st["invert"] or st["rot180"]):
-            return line
-    except ValueError:
-        return line
-    return ",".join(f) + "\n"
-
-
-def write_stats(path, rate, fusion):
-    d = {"rate": rate, "wall": time.time()}
-    if fusion is not None:
-        d.update(fusion=fusion.status, offset_deg=None if fusion.o is None else fusion.o,
-                 accel_sign=fusion.s, cam_sign=fusion.cs, cam_fresh=fusion.fresh)
-    try:
-        with open(path + ".tmp", "w") as f:
-            json.dump(d, f)
-        os.replace(path + ".tmp", path)
-    except OSError:
-        pass
-
-
-def _neg(s):
-    return "%.4f" % -float(s)
+    def write_stats(self, dt):
+        kf, s = self.kf, self.last_cal
+        cal = {"state": "idle", "prompt": "", "progress": 0.0, "result": None} if not s else {
+            "state": s.state, "prompt": s.message if self.cal and s.message else s.prompt,
+            "progress": s.progress, "result": s.result}
+        try:
+            calibrate.save(self.paths[".stats"], {
+                "rate": self.n_acc / dt, "cam_hz": self.n_cam / dt, "wall": time.time(),
+                "fusion": "locked" if kf.cam_ok else ("waiting" if kf.w_eff > 0 else "off"),
+                "offset_deg": None if kf.x is None else kf.x[2], "w": kf.w, "resp": kf.resp,
+                "src": kf.src, "cal": dict(cal, calibrated=kf.calibrated)})
+        except OSError:
+            pass
+        self.n_acc = self.n_cam = 0
 
 
 def main():
-    argv = sys.argv[1:]
-    if "--state" not in argv or "--" not in argv:
-        sys.exit(__doc__)
-    state_path = argv[argv.index("--state") + 1]
-    cmd = argv[argv.index("--") + 1:]
-    if not cmd:
-        sys.exit("no source command after --")
+    ap = argparse.ArgumentParser(description="Sensor lines in, K/M lines out (see the module docstring).")
+    ap.add_argument("--state", default="build/leg_state.json")
+    ap.add_argument("--auto-zero", type=float, default=0.0, metavar="SECS",
+                    help="quick zero after SECS of data, when uncalibrated (demo: 1.5)")
+    ap.add_argument("--no-cal", action="store_true", help="ignore saved calibrations and save none")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <source command ...>")
+    a = ap.parse_args()
+    os.makedirs(os.path.dirname(os.path.abspath(a.state)), exist_ok=True)
 
-    child = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0)
-    stop = {"now": False}
-
-    def _sig(signum, frame):
-        stop["now"] = True
+    child = subprocess.Popen(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, stdout=subprocess.PIPE, bufsize=0)
     for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sg, _sig)
-
-    fusion = Fusion()
-    cam_path = state_path + ".cam"
-    st, mt = {"invert": False, "rot180": False, "assist": True}, None
-    st, mt = load_state(state_path, st, mt)
-    last_poll = last_cam = time.monotonic()
-    cam_mt = None
-    n_samples, stats_t, stats_path = 0, time.monotonic(), state_path + ".stats"
-    buf = b""
-    out = sys.stdout.buffer
-    fd = child.stdout.fileno()
+        signal.signal(sg, signal.default_int_handler)     # raise KeyboardInterrupt: clean shutdown
+    lf = LegFilter(a.state, a.auto_zero, not a.no_cal)
+    out, fd, buf = sys.stdout.buffer, child.stdout.fileno(), b""
+    t_poll = t_stats = t_coast = t_written = time.monotonic()
     try:
-        while not stop["now"]:
-            r, _, _ = select.select([fd], [], [], 0.2)
+        while True:
+            readable, _, _ = select.select([fd], [], [], 0.01)
             now = time.monotonic()
-            if now - last_poll > 0.1:
-                st, mt = load_state(state_path, st, mt)
-                last_poll = now
-            if now - last_cam > 0.02:                # camera knee angle from the panel
-                last_cam = now
-                try:
-                    m = os.stat(cam_path).st_mtime
-                    if m != cam_mt:
-                        cam_mt = m
-                        fusion.set_cam(read_json(cam_path))
-                except OSError:
-                    pass
-            if now - stats_t >= 0.5:                 # readout for the panel
-                write_stats(stats_path, n_samples / (now - stats_t), fusion)
-                n_samples, stats_t = 0, now
-            if not r:
-                out.write(b"\n")            # heartbeat: keeps the viewer's fgets from blocking forever
+            if readable:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break               # the source ended
+                *lines, buf = (buf + chunk).split(b"\n")
+                for ln in lines:
+                    lf.on_line(ln.decode("ascii", "replace").strip(), now)
+            lf.poll_cam(now)
+            if now - t_poll >= 0.1:
+                lf.poll_files()
+                t_poll = now
+            if lf.t_arr is not None and now - lf.t_arr > COAST_AFTER_S and now - t_coast >= 0.02:
+                t_coast, c = now, lf.kf.tick(now - SERIAL_LAT_S)
+                if c:
+                    lf.emit(now - SERIAL_LAT_S, c[0], c[1], coast=True)
+            if now - t_stats >= 0.5:
+                lf.write_stats(now - t_stats)
+                t_stats = now
+            if not lf.out and now - t_written > 0.2:
+                lf.out.append("\n")     # heartbeat, so the viewer's blocking read returns
+            if lf.out:
+                out.write("".join(lf.out).encode("ascii", "replace"))
                 out.flush()
-                if child.poll() is not None:
-                    break
-                continue
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            buf += chunk
-            *lines, buf = buf.split(b"\n")
-            for ln in lines:
-                if ln.count(b",") >= 6:
-                    n_samples += 1
-                out.write(transform(ln.decode("ascii", "replace") + "\n", st, fusion).encode("ascii", "replace"))
-            out.flush()
-    except (BrokenPipeError, OSError):
-        pass
+                lf.out, t_written = [], now
+    except (OSError, KeyboardInterrupt):
+        pass                            # BrokenPipeError: the viewer closed the pipe; or a signal
     finally:
         if child.poll() is None:
-            child.send_signal(signal.SIGINT)    # bridge sends 'X' and releases the port
+            child.send_signal(signal.SIGINT)    # serial_bridge sends 'X' and releases the port
             try:
                 child.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 child.kill()
-    os._exit(0)   # skip interpreter-shutdown flush of the (possibly closed) pipe
+    os._exit(0)     # skip the interpreter's final flush onto a possibly closed pipe
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

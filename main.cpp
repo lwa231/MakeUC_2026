@@ -1,12 +1,16 @@
 // Brace Tracker viewer: live 3D knee (thigh + shin on a hinge).
 //
-// Live data: this program launches a helper (default: fake_pi.py) and reads its
-// stdout, one line per sample at ~100 Hz, comma-separated, in g:
-//     t_ms,thigh_x,thigh_y,thigh_z,shank_x,shank_y,shank_z
-// All the math is done here in C++: low-pass filter, tilt of each segment, knee
-// angle (shank tilt - thigh tilt), quality, and zero calibration.
-// To use the real Pi, replace fake_pi.py with anything that prints the same lines
-// (flush every line), or pass --pi-cmd "your command".
+// Live data: this program launches a helper (--pi-cmd) and reads its stdout. The default
+// is the mock pipeline (swap mock_sensors.py for serial_bridge.py on the real brace):
+//     python3 live/leg_filter.py --state build/leg_state.json --auto-zero 1.5
+//         -- python3 live/mock_sensors.py --cam-out build/leg_state.json.cam
+// Lines understood:
+//   K,t_ms,theta,omega,flags,w   fused knee angle from leg_filter.py (preferred). Shown a
+//       small delay D behind real time (D adapts to arrival jitter, 10-80 ms) and cubic
+//       Hermite interpolated every frame, so bursty ~100 Hz input renders smoothly.
+//   M,level,text                 a message (calibration prompts/results) for the title.
+//   t_ms,thigh_x,thigh_y,thigh_z,shank_x,shank_y,shank_z   legacy raw accel in g: the
+//       knee is computed here (5 Hz low-pass, shank tilt - thigh tilt, local zero).
 //
 // Rendering: a tapered thigh and calf (lathe meshes sized from the circumferences),
 // a knee ball and a foot. Every part is derived from the four measurements and one
@@ -25,7 +29,11 @@
 //   3. Live with the keys below.
 //
 // Controls
-//   Z             zero-calibrate: hold the leg straight for 2 s (live data only)
+//   Z             zero: hold the leg straight (K lines: leg_filter zeroes; legacy: 2 s here)
+//   C             calibrate (leg_filter; follow the prompts in the title)
+//   [ / ]         camera weight w -/+ 0.05      ; / '   responsiveness -/+ 0.1
+//   V             source: fused -> sensors only -> camera only
+//                 (C [ ] ; ' V Z are written to <state>.viewer, which leg_filter polls)
 //   UP / DOWN     knee flexion +/-  (manual only; 0 deg = straight, flexion positive)
 //   Q / A         thigh circumference +/-
 //   W / S         calf circumference +/-
@@ -35,8 +43,10 @@
 //   R             reset angle and camera
 //   ESC           quit
 //
-// Options: --pi-cmd "command"   (default: "python fake_pi.py", or python3 off Windows)
+// Options: --pi-cmd "command"   (default above; "python" instead of "python3" on Windows)
 //          --scale s            (overall leg size, 1.0 = as measured)
+//          --state PATH         (leg_filter state file, default build/leg_state.json)
+//          --playout-ms N       (fixed playout delay instead of the adaptive one)
 
 #ifdef _MSC_VER
   #define _CRT_SECURE_NO_WARNINGS
@@ -55,6 +65,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,9 +95,75 @@ static std::atomic<float> g_liveKnee{0.0f};
 static std::atomic<float> g_liveQuality{0.0f};
 static std::atomic<long long> g_lastLiveMs{-1};  // steady-clock ms of the last sample
 
+// ---- K lines (live/leg_filter.py) ----
+constexpr int kFlagCamOk = 1, kFlagCoast = 2, kFlagCalibrating = 4, kFlagUncalibrated = 8, kFlagReset = 16;
+constexpr double kDelayMinS = 0.010, kDelayMaxS = 0.080;  // adaptive playout delay range
+constexpr double kDelayMarginS = 0.004;  // playout delay = q90 of arrival lateness + this
+constexpr double kExtrapTauS = 0.05;     // starved: damped extrapolation with this time constant...
+constexpr double kHoldS = 0.3;           // ...frozen after this long
+constexpr double kHermiteMaxGapS = 0.06; // wider sample gaps are bridged linearly (no overshoot)
+constexpr long long kMessageHoldMs = 20000;  // an M message stays in the title this long
+constexpr int kRingSize = 256;
+
+struct KSample {
+    double tau;            // time on our steady clock (s)
+    float theta, omega;    // knee angle (deg), rate (deg/s)
+    int flags;             // kFlag* bits
+};
+
+// Shared between the reader thread (writes) and the render thread (reads).
+static std::mutex g_kMutex;              // guards the ring and the message
+static KSample g_ring[kRingSize];
+static int g_ringHead = 0, g_ringCount = 0;
+static std::string g_msg;
+static long long g_msgMs = -1;
+static std::atomic<long long> g_lastKMs{-1};  // steady-clock ms of the last K line
+static std::atomic<double> g_q90{0.015};      // 90th percentile of K-line arrival lateness (s)
+static std::atomic<int> g_kFlags{0};
+static std::atomic<float> g_kW{-1.0f};        // w reported by leg_filter (< 0 = none yet)
+
 static long long nowMs() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static double steadySec() {
+    using namespace std::chrono;
+    return duration<double>(steady_clock::now().time_since_epoch()).count();
+}
+
+// Maps leg_filter's clock onto ours. The offset is the lower envelope of (arrival - remote):
+// the least-delayed line defines it, so bursty delivery does not move it. It creeps up 2 ms/s
+// to follow drift, and re-anchors if the remote clock jumps back or the delay jumps by > 1 s.
+struct ClockMap {
+    bool have = false;
+    double off = 0.0, lastRemote = 0.0, lastArrival = 0.0;
+    double map(double remote, double arrival) {
+        const double o = arrival - remote;
+        if (have) off += 0.002 * (arrival - lastArrival);
+        if (!have || o < off || o - off > 1.0 || remote < lastRemote - 0.2) off = o;
+        have = true;
+        lastRemote = remote;
+        lastArrival = arrival;
+        return remote + off;
+    }
+};
+
+// Reader thread: timestamps one K sample, updates the lateness quantile and stores it.
+static void addK(ClockMap& clock, double tMs, float theta, float omega, int flags, float w) {
+    const double arrival = steadySec();
+    const double tau = clock.map(tMs / 1000.0, arrival);
+    double q = g_q90.load();  // stochastic quantile tracker: +0.45 ms if late, -0.05 ms if not
+    q += 0.0005 * (0.9 - (arrival - tau <= q ? 1.0 : 0.0));
+    g_q90 = std::clamp(q, 0.0, kDelayMaxS);
+    g_kFlags = flags;
+    g_kW = w;
+    g_lastKMs = g_lastLiveMs = nowMs();
+    std::lock_guard<std::mutex> lock(g_kMutex);
+    if (g_ringCount > 0 && tau <= g_ring[(g_ringHead + kRingSize - 1) % kRingSize].tau) return;
+    g_ring[g_ringHead] = {tau, theta, omega, flags};
+    g_ringHead = (g_ringHead + 1) % kRingSize;
+    g_ringCount = std::min(g_ringCount + 1, kRingSize);
 }
 
 static float wrapDeg(float a) { return std::fmod(std::fmod(a + 180.0f, 360.0f) + 360.0f, 360.0f) - 180.0f; }
@@ -117,8 +194,27 @@ static void liveReaderThread(std::string cmd) {
     bool zeroing = false;
     double zeroEnd = 0.0, zSin = 0.0, zCos = 0.0;
 
+    ClockMap kClock;
     char line[256];
     while (g_running && std::fgets(line, sizeof(line), pipe)) {
+        line[std::strcspn(line, "\r\n")] = '\0';
+        if (line[0] == 'K' && line[1] == ',') {
+            double tMs, th, om, w;
+            int flags;
+            if (std::sscanf(line, "K,%lf,%lf,%lf,%d,%lf", &tMs, &th, &om, &flags, &w) == 5 &&
+                std::isfinite(tMs) && std::isfinite(th))
+                addK(kClock, tMs, (float)th, std::isfinite(om) ? (float)om : 0.0f, flags, (float)w);
+            continue;
+        }
+        if (line[0] == 'M' && line[1] == ',') {
+            const char* text = std::strchr(line + 2, ',');
+            if (!text) continue;
+            const bool warn = !std::strncmp(line + 2, "warn", 4);
+            std::lock_guard<std::mutex> lock(g_kMutex);
+            g_msg = (warn ? "WARNING: " : "") + std::string(text + 1);
+            g_msgMs = nowMs();
+            continue;
+        }
         double tMs;
         float v[6];
         if (std::sscanf(line, "%lf,%f,%f,%f,%f,%f,%f", &tMs, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 7)
@@ -160,6 +256,98 @@ static void liveReaderThread(std::string cmd) {
     pclose(pipe);
 }
 
+// Playout delay: fixed (--playout-ms) or just above the 90th percentile of arrival lateness.
+static double playoutDelay(double fixedMs) {
+    if (fixedMs >= 0.0) return fixedMs / 1000.0;
+    return std::clamp(g_q90.load() + kDelayMarginS, kDelayMinS, kDelayMaxS);
+}
+
+// Knee angle at local time tr (= now - playout delay): cubic Hermite between the two samples
+// around tr with omega as the slopes. Past the newest sample: damped extrapolation, then hold.
+// Never blends into a RESET sample (zero/calibration/source change): holds, then snaps.
+static float playoutAngle(double tr) {
+    std::lock_guard<std::mutex> lock(g_kMutex);
+    auto back = [](int i) -> const KSample& { return g_ring[(g_ringHead - 1 - i + kRingSize) % kRingSize]; };
+    const KSample& n = back(0);  // newest
+    if (g_ringCount < 2 || tr >= n.tau) {
+        const double e = std::clamp(tr - n.tau, 0.0, kHoldS);
+        return n.theta + n.omega * (float)(kExtrapTauS * (1.0 - std::exp(-e / kExtrapTauS)));
+    }
+    int i = 1;
+    while (i < g_ringCount - 1 && back(i).tau > tr) ++i;
+    const KSample& s0 = back(i);
+    const KSample& s1 = back(i - 1);
+    if (tr <= s0.tau || (s1.flags & kFlagReset)) return s0.theta;
+    const double h = s1.tau - s0.tau, s = (tr - s0.tau) / h;
+    if (h > kHermiteMaxGapS) return (float)(s0.theta + (s1.theta - s0.theta) * s);
+    const double s2 = s * s, s3 = s2 * s;
+    return (float)((2 * s3 - 3 * s2 + 1) * s0.theta + (s3 - 2 * s2 + s) * h * s0.omega +
+                   (-2 * s3 + 3 * s2) * s1.theta + (s3 - s2) * h * s1.omega);
+}
+
+// Settings the keys send to leg_filter through <state>.viewer (main thread only). Between key
+// presses w follows the K lines, so a key steps from what leg_filter is actually using.
+static const char* const kSrcNames[3] = {"fused", "accel", "camera"};
+static struct {
+    std::string path;  // <state>.viewer
+    double w = 0.15, resp = 0.5;
+    int src = 0;       // index into kSrcNames
+    long zeroSeq = 0, calSeq = 0;
+    bool dirty = false;
+    double lastKeyT = -1e9, lastWriteT = -1e9;
+} g_tune;
+
+// Continue from an existing file, so leg_filter sees zero_seq / cal_seq increase.
+static void loadTune() {
+    FILE* f = std::fopen(g_tune.path.c_str(), "r");
+    if (!f) return;
+    char text[512];
+    text[std::fread(text, 1, sizeof(text) - 1, f)] = '\0';
+    std::fclose(f);
+    auto num = [&](const char* key, double def) {
+        const char* p = std::strstr(text, key);
+        return (p && (p = std::strchr(p, ':'))) ? std::atof(p + 1) : def;
+    };
+    g_tune.resp = num("\"resp\"", g_tune.resp);
+    g_tune.zeroSeq = (long)num("\"zero_seq\"", 0);
+    g_tune.calSeq = (long)num("\"cal_seq\"", 0);
+    for (int i = 0; i < 3; ++i)
+        if (std::strstr(text, (std::string("\"") + kSrcNames[i] + "\"").c_str())) g_tune.src = i;
+}
+
+static void tuneKey(int key) {
+    auto step = [](double v, double d) { return std::clamp(std::round((v + d) * 100.0) / 100.0, 0.0, 1.0); };
+    if (key == GLFW_KEY_LEFT_BRACKET) g_tune.w = step(g_tune.w, -0.05);
+    else if (key == GLFW_KEY_RIGHT_BRACKET) g_tune.w = step(g_tune.w, 0.05);
+    else if (key == GLFW_KEY_SEMICOLON) g_tune.resp = step(g_tune.resp, -0.1);
+    else if (key == GLFW_KEY_APOSTROPHE) g_tune.resp = step(g_tune.resp, 0.1);
+    else if (key == GLFW_KEY_V) g_tune.src = (g_tune.src + 1) % 3;
+    else if (key == GLFW_KEY_Z) ++g_tune.zeroSeq;
+    else if (key == GLFW_KEY_C) ++g_tune.calSeq;
+    else return;
+    g_tune.dirty = true;
+    g_tune.lastKeyT = steadySec();
+}
+
+// Once per frame: follow leg_filter's w between key presses; write pending changes
+// atomically (tmp + rename), at most 10 times a second.
+static void updateTune(double T) {
+    if (T - g_tune.lastKeyT > 1.0 && g_kW.load() >= 0.0f) g_tune.w = std::round(g_kW.load() * 100.0) / 100.0;
+    if (!g_tune.dirty || T - g_tune.lastWriteT < 0.1) return;
+    g_tune.dirty = false;
+    g_tune.lastWriteT = T;
+    const std::string tmp = g_tune.path + ".tmp";
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (!f) { std::fprintf(stderr, "Cannot write %s\n", tmp.c_str()); return; }
+    std::fprintf(f, "{\"w\": %.2f, \"resp\": %.2f, \"src\": \"%s\", \"zero_seq\": %ld, \"cal_seq\": %ld}\n",
+                 g_tune.w, g_tune.resp, kSrcNames[g_tune.src], g_tune.zeroSeq, g_tune.calSeq);
+    std::fclose(f);
+#ifdef _WIN32
+    std::remove(g_tune.path.c_str());  // rename does not replace an existing file on Windows
+#endif
+    if (std::rename(tmp.c_str(), g_tune.path.c_str()) != 0) std::fprintf(stderr, "Cannot write %s\n", g_tune.path.c_str());
+}
+
 // ---- live data (end) ----
 // ================================================================================
 
@@ -168,6 +356,7 @@ static void liveReaderThread(std::string cmd) {
 constexpr float kUnitsPerCm = 0.035f;  // world units per centimeter (keeps the leg ~3 units long)
 constexpr bool kShowSeatAndFloor = true;  // false = draw only the leg
 constexpr float kMaxKneeDeg = 120.0f;     // display limit; the seat is sized so the calf clears it up to here
+constexpr float kMinKneeDeg = -10.0f;     // display limit (hyperextension)
 
 struct LegState {
     float kneeDeg = 0.0f;         // 0 = full extension, flexion positive
@@ -186,16 +375,20 @@ static bool g_autoSweep = true;
 static float g_camYawDeg = 0.0f;
 static int g_fbWidth = 1000, g_fbHeight = 700;
 #ifdef _WIN32
-static std::string g_piCmd = "python fake_pi.py";
+  #define PYTHON_CMD "python"
 #else
-static std::string g_piCmd = "python3 fake_pi.py";
+  #define PYTHON_CMD "python3"
 #endif
+static std::string g_piCmd = PYTHON_CMD " live/leg_filter.py --state build/leg_state.json --auto-zero 1.5 -- "
+                             PYTHON_CMD " live/mock_sensors.py --cam-out build/leg_state.json.cam";
+static std::string g_statePath = "build/leg_state.json";  // --state; the keys write <state>.viewer
+static double g_playoutMs = -1.0;                          // --playout-ms; < 0 = adaptive
 
 // Circumference -> diameter, assuming a roughly circular cross-section.
 static float diameterCm(float circCm) { return circCm / kPi; }
 
 static void clampLeg() {
-    g_leg.kneeDeg = std::clamp(g_leg.kneeDeg, 0.0f, kMaxKneeDeg);
+    g_leg.kneeDeg = std::clamp(g_leg.kneeDeg, kMinKneeDeg, kMaxKneeDeg);
     g_leg.thighCircCm = std::clamp(g_leg.thighCircCm, 20.0f, 100.0f);
     g_leg.calfCircCm = std::clamp(g_leg.calfCircCm, 15.0f, 80.0f);
     g_leg.thighLenCm = std::clamp(g_leg.thighLenCm, 20.0f, 80.0f);
@@ -216,11 +409,15 @@ static void parseArgs(int argc, char** argv) {
             *target = (float)std::atof(argv[++i]);
         } else if (!std::strcmp(argv[i], "--pi-cmd") && i + 1 < argc) {
             g_piCmd = argv[++i];
+        } else if (!std::strcmp(argv[i], "--state") && i + 1 < argc) {
+            g_statePath = argv[++i];
+        } else if (!std::strcmp(argv[i], "--playout-ms") && i + 1 < argc) {
+            g_playoutMs = std::max(0.0, std::atof(argv[++i]));
         } else {
             std::fprintf(stderr,
                          "Unknown or incomplete option '%s'\n"
                          "Usage: viewer [--thigh-circ cm] [--calf-circ cm] [--thigh-len cm] [--shin-len cm] [--scale s]\n"
-                         "              [--pi-cmd \"command that prints samples\"]\n",
+                         "              [--pi-cmd \"command\"] [--state PATH] [--playout-ms N]\n",
                          argv[i]);
         }
     }
@@ -436,13 +633,17 @@ static void keyCallback(GLFWwindow* win, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(win, GLFW_TRUE);
     if (key == GLFW_KEY_SPACE) g_autoSweep = !g_autoSweep;
     if (key == GLFW_KEY_R) { g_leg.kneeDeg = 0.0f; g_camYawDeg = 0.0f; }
-    if (key == GLFW_KEY_Z) g_zeroRequested = true;
+    const bool kLive = g_lastKMs.load() >= 0 && nowMs() - g_lastKMs.load() <= 1000;
+    if (key == GLFW_KEY_Z && !kLive) g_zeroRequested = true;  // legacy: zero here
+    else tuneKey(key);                                         // otherwise leg_filter does it
 }
 
 // ----------------------------------------------------------------- main ----
 
 int main(int argc, char** argv) {
     parseArgs(argc, argv);
+    g_tune.path = g_statePath + ".viewer";
+    loadTune();
 
     std::thread liveThread(liveReaderThread, g_piCmd);
 
@@ -517,13 +718,23 @@ int main(int argc, char** argv) {
         if (held(GLFW_KEY_EQUAL)) g_leg.scale += 0.5f * dt;
         if (held(GLFW_KEY_MINUS)) g_leg.scale -= 0.5f * dt;
 
+        const double frameT = steadySec();
+        updateTune(frameT);
+
         // ---- choose the angle source ----
-        const long long lastLive = g_lastLiveMs.load();
+        const long long lastLive = g_lastLiveMs.load(), lastK = g_lastKMs.load();
         const bool everLive = lastLive >= 0;
         const bool liveFresh = everLive && (nowMs() - lastLive) <= 500;
+        const bool kFresh = lastK >= 0 && (nowMs() - lastK) <= 500;
         const char* source;
         float quality = -1.0f;
-        if (liveFresh) {
+        float kTheta = 0.0f;
+        if (kFresh) {
+            kTheta = playoutAngle(frameT - playoutDelay(g_playoutMs));
+            g_leg.kneeDeg = kTheta;
+            g_autoSweep = false;
+            source = "LIVE";
+        } else if (liveFresh) {
             g_leg.kneeDeg = g_liveKnee.load();
             quality = g_liveQuality.load();
             g_autoSweep = false;  // real data takes over from the demo
@@ -542,8 +753,21 @@ int main(int argc, char** argv) {
         }
         clampLeg();
 
-        char title[200];
-        if (quality >= 0.0f) {
+        char title[400];
+        if (kFresh) {
+            const int flags = g_kFlags.load();
+            const char* state = (flags & kFlagCalibrating) ? "CALIBRATING"
+                                : (flags & kFlagUncalibrated) ? "UNCAL (press C)" : "CAL";
+            std::string msg;
+            {
+                std::lock_guard<std::mutex> lock(g_kMutex);
+                if (g_msgMs >= 0 && nowMs() - g_msgMs <= kMessageHoldMs) msg = " | " + g_msg;
+            }
+            std::snprintf(title, sizeof(title),
+                          "Brace Tracker | knee %.1f deg%s | %s %s%s | w %.2f resp %.1f %s | %s | [ ]=w ;'=resp V=src Z=zero C=cal",
+                          kTheta, msg.c_str(), source, (flags & kFlagCoast) ? "NO SENSOR DATA " : "",
+                          kSrcNames[g_tune.src], g_tune.w, g_tune.resp, (flags & kFlagCamOk) ? "cam OK" : "cam --", state);
+        } else if (quality >= 0.0f) {
             std::snprintf(title, sizeof(title),
                           "Brace Tracker | knee %.1f deg | %s q=%.2f | thigh circ %.0f cm | calf circ %.0f cm | size x%.2f",
                           g_leg.kneeDeg, source, quality, g_leg.thighCircCm, g_leg.calfCircCm, g_leg.scale);

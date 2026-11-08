@@ -3,13 +3,13 @@
 
     python3 live/run_live.py                    # real board -> viewer
     python3 live/run_live.py --pretty-check 5   # bridge only, 5 s, prints the sample rate first
-    python3 live/run_live.py --demo             # fake_pi.py instead of hardware
+    python3 live/run_live.py --demo             # live/mock_sensors.py (accelerometers + camera) instead
     python3 live/run_live.py --dry-run          # just print the command that would run
 
-It only *launches* the existing programs (build/viewer, serial_bridge.py, fake_pi.py);
-it does not change them. The viewer starts the bridge itself through its --pi-cmd option:
+It only *launches* the programs (build/viewer, live/leg_filter.py, serial_bridge.py or
+live/mock_sensors.py, live/leg_panel.py). The viewer starts the data chain through --pi-cmd:
 
-    build/viewer --pi-cmd "<python> <repo>/serial_bridge.py --port <port> [extra]"
+    build/viewer --state build/leg_state.json --pi-cmd "<python> live/leg_filter.py --state ... -- <source>"
 
 Stdlib only; works from any working directory.
 """
@@ -29,7 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 BRIDGE = os.path.join(REPO, "serial_bridge.py")
-FAKE = os.path.join(REPO, "fake_pi.py")
+MOCK = os.path.join(HERE, "mock_sensors.py")
 REQS = os.path.join(REPO, "requirements.txt")
 BUILD_SH = os.path.join(HERE, "build_viewer.sh")
 IS_WIN = os.name == "nt"
@@ -233,9 +233,10 @@ LEG_PANEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leg_panel.
 LEG_STATE = os.path.join(REPO, "build", "leg_state.json")
 
 
-def wrap_with_leg_filter(src):
-    """viewer -> leg_filter.py -> data source: applies the left/right-leg axis fix."""
-    return [sys.executable, LEG_FILTER, "--state", LEG_STATE, "--"] + src
+def wrap_with_leg_filter(src, demo):
+    """viewer -> leg_filter.py -> data source: leg mapping, calibration, camera fusion, smoothing.
+    The demo zeroes itself on the mock's opening straight hold (real legs: press C or Z)."""
+    return [sys.executable, LEG_FILTER, "--state", LEG_STATE] + (["--auto-zero", "1.5"] if demo else []) + ["--"] + src
 
 
 def start_leg_panel(leg, cam_index, use_camera, marker_cm):
@@ -266,7 +267,7 @@ def write_leg_state(leg):
 def source_argv(args, port):
     """argv of the data helper (what the viewer will popen)."""
     if args.demo:
-        return [sys.executable, FAKE]
+        return [sys.executable, MOCK, "--scenario", args.scenario, "--cam-out", LEG_STATE + ".cam"]
     argv = [sys.executable, BRIDGE, "--port", port or "<NO-PORT-FOUND>"]
     if args.no_position:
         argv += ["--no-position"]
@@ -361,6 +362,8 @@ def pretty_check(argv, secs, is_bridge):
             v = [float(x) for x in f[1:7]]
         except ValueError:
             continue
+        if len(v) < 6:      # '#' status lines
+            continue
         vals.append(v)
         mags[0].append((v[0] ** 2 + v[1] ** 2 + v[2] ** 2) ** 0.5)
         mags[1].append((v[3] ** 2 + v[4] ** 2 + v[5] ** 2) ** 0.5)
@@ -454,9 +457,11 @@ def reap_after_viewer(viewer, port, uses_bridge):
 def main():
     ap = argparse.ArgumentParser(
         description="Launch the Brace Tracker 3D viewer fed by the Arduino serial bridge.",
-        epilog='examples:  run_live.py | run_live.py --pretty-check | run_live.py --demo | '
+        epilog='examples:  run_live.py | run_live.py --pretty-check | run_live.py --demo --scenario fast | '
                'run_live.py --viewer-args "--thigh-len 46 --shin-len 43" --bridge-args "--zero-secs 2"')
-    ap.add_argument("--demo", action="store_true", help="use fake_pi.py (synthetic data) instead of the Arduino")
+    ap.add_argument("--demo", action="store_true", help="use mock_sensors.py (simulated brace + camera) instead of the Arduino")
+    ap.add_argument("--scenario", default="default", choices=("default", "fast", "slow", "badcam", "calib"),
+                    help="--demo motion: calib = a Hang and Straighten session (press C at the start)")
     ap.add_argument("--port", help="serial port (default: auto-detect, e.g. /dev/cu.usbmodem11401 or COM5)")
     ap.add_argument("--camera", type=int, nargs="?", const=0, default=0, metavar="N",
                     help="camera index for the live ArUco view in the control panel (default 0; "
@@ -480,8 +485,8 @@ def main():
     args = ap.parse_args()
     install = not args.no_install
 
-    if not os.path.isfile(BRIDGE) or not os.path.isfile(FAKE):
-        die(f"expected {BRIDGE} and {FAKE} in the repo root")
+    if not os.path.isfile(BRIDGE) or not os.path.isfile(MOCK):
+        die(f"expected {BRIDGE} and {MOCK}")
 
     use_hw = not args.demo
     if use_hw and not args.dry_run:
@@ -517,7 +522,7 @@ def main():
     src = source_argv(args, port)
     viewer = viewer_path(args.viewer)
     vargs = shlex.split(args.viewer_args, posix=not IS_WIN) if args.viewer_args else []
-    vcmd = [viewer, "--pi-cmd", quote(wrap_with_leg_filter(src)), *vargs]
+    vcmd = [viewer, "--state", LEG_STATE, "--pi-cmd", quote(wrap_with_leg_filter(src, args.demo)), *vargs]
 
     if args.dry_run:
         say("python:  " + sys.executable)
@@ -543,17 +548,20 @@ def main():
 
     ensure_viewer(viewer, dry_run=False)
     panel = None
+    leg = args.leg or ("left" if args.demo else None)     # the mock is a left leg
     if args.no_panel:
-        write_leg_state(args.leg or "left")
-    else:
-        panel, why, leg = start_leg_panel(args.leg, args.camera, not args.no_camera, args.marker_cm)
+        write_leg_state(leg or "left")
+    else:   # in --demo the mock writes the camera file, so the panel leaves the webcam alone
+        panel, why, leg = start_leg_panel(leg, args.camera, not (args.no_camera or args.demo), args.marker_cm)
         if panel is None:
             say("control panel unavailable (%s); using the %s leg" % (why, leg))
         else:
             say("control panel open (leg: %s). Switch LEFT/RIGHT there any time." % leg)
     say("source: " + quote(src))
     say("starting viewer (close the window or Ctrl+C here to quit)")
-    say("keys: Z zero (hold leg straight 2 s) | SPACE auto-demo | R reset | LEFT/RIGHT orbit | ESC quit")
+    say("calibrate each session: press C (or Calibrate in the panel), sit, let the shin hang, follow the prompts")
+    say("keys: C calibrate | Z zero (only if truly straight) | [ ] camera weight | ; ' responsiveness | "
+        "V source | LEFT/RIGHT orbit | ESC quit")
     p = subprocess.Popen(vcmd, cwd=REPO, start_new_session=not IS_WIN)
     code = 0
 
