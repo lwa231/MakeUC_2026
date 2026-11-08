@@ -22,7 +22,8 @@ SPACE = {
     "R_CAM0": (True, 0.1, 20.0), "DEV_G": (True, 0.01, 0.5), "DEAD_G": (False, 0.0, 0.2),
     "Q_B": (True, 0.001, 20.0), "GATE": (False, 2.5, 8.0),
     "DYN_RES": (False, 0.0, 1.0), "BLIP_SIGMA": (False, 1.5, 8.0), "CAM_DELAY_GAIN": (True, 0.002, 0.3),
-    "EURO_FMIN": (True, 0.1, 5.0), "EURO_BETA": (True, 0.005, 5.0),
+    "EURO_FMIN": (True, 0.1, 5.0), "EURO_BETA": (True, 0.005, 5.0), "Q_BW": (True, 1e-3, 10.0),
+    "CONF_POW": (False, 0.0, 3.0), "CMAP_GAIN": (True, 0.003, 0.5),
     "Q_ACC_A": (True, 30.0, 1e6), "R_ACC0_ACC": (True, 0.3, 50.0), "DEV_G_ACC": (True, 0.01, 0.5),
     "DEAD_G_ACC": (False, 0.0, 0.2), "BLIP_SIGMA_ACC": (False, 1.5, 8.0),
     "EURO_FMIN_ACC": (True, 0.1, 5.0), "EURO_BETA_ACC": (True, 0.005, 5.0),
@@ -57,6 +58,13 @@ def objective(p, seeds, detail=False):
     res = FB.bench(seeds, (KE.W_DEFAULT, 0.0), None, to_overrides(p))
     jf = sum(res[n, KE.W_DEFAULT]["J"] for n in FB.SCEN) / len(FB.SCEN)
     ja = sum(res[n, 0.0]["J"] for n in FB.SCEN) / len(FB.SCEN)
+    if MODE == "combo":       # half the fused score from frames rendered through the real camera tracker
+        import e2e_camera as E2E
+        r2 = E2E.bench((KE.W_DEFAULT,), to_overrides(p))
+        je = sum(r2[st[0], KE.W_DEFAULT]["J"] for st in E2E.SETUPS) / len(E2E.SETUPS)
+        jf = 0.5 * (jf + je)
+        if detail:
+            res["e2e"] = r2
     return (jf + ACCEL_WEIGHT * ja, jf, ja, res) if detail else jf + ACCEL_WEIGHT * ja
 
 
@@ -66,7 +74,7 @@ def main():
     ap.add_argument("--seeds", default="1,2,3")
     ap.add_argument("--only", help="comma list of parameters to search")
     ap.add_argument("--start", help="json file with a starting parameter set")
-    ap.add_argument("--mode", default="both", choices=("both", "accel"))
+    ap.add_argument("--mode", default="both", choices=("both", "accel", "combo"))
     ap.add_argument("--out", default="best_params.json")
     a = ap.parse_args()
     global MODE

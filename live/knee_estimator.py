@@ -63,6 +63,9 @@ CAM_DELAY_STEP = 0.06 # one frame's delay error estimate is clipped to this (s)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
+CMAP_GAIN = 0.02      # learning rate of the accelerometer error map (per still camera frame); 0 = off
+CMAP_SPEED = 30.0     # ... learned only from frames slower than this (deg/s)
+CMAP_MAX_ERR = 15.0   # ... and only when accel and camera disagree by less than this (deg)
 CONF_POW = 2.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
 CAM_H = (1.0, 0.0, 0.0, 0.0)  # camera row: camera = theta (accel = theta + b + swing, see _accel_z)
 N = 4
@@ -175,6 +178,7 @@ class KneeFilter:
         self.cam_delay = CAM_DELAY0  # learned exposure -> t_cap delay (s)
         self.cam_var = R_CAM0        # learned camera angle variance (deg^2) at w = 1
         self.rej = []                # recently rejected camera frames [(t, knee)]
+        self.cmap = [0.0] * 4        # learned accel error vs knee angle (sin, cos, sin 2x, cos 2x; deg)
         self.n_relock = 0
         self.euro = OneEuro()
         self.set(w, resp)
@@ -226,7 +230,9 @@ class KneeFilter:
         h = (1.0 + kr * (a * c - w * w * sn),                    # d(theta + b + d)/dx (0 where clipped)
              kr * 2.0 * w * c if abs(x[1]) < OMEGA_MAX else 0.0,
              kr * sn if abs(x[2]) < ALPHA_MAX else 0.0, 1.0)
-        pred = x[0] + x[3] + d
+        g, dg = self._cmap(x[0])
+        h = (h[0] + dg, h[1], h[2], h[3])
+        pred = x[0] + x[3] + d + g
         z = pred + wrap(tilt(sx, sy) - tau_t - self.k - pred)    # continuous near the prediction
         # |a| of the shank also changes with the swing (by (r/g)(omega^2 sin theta - alpha cos theta));
         # what is left beyond that is unmodelled motion or a jolt
@@ -235,7 +241,7 @@ class KneeFilter:
         w_eff = self.w_eff if w_eff is None else w_eff
         r0, dg, dd = (R_ACC0, DEV_G, DEAD_G) if fused else (R_ACC0_ACC, DEV_G_ACC, DEAD_G_ACC)
         r = r0 / max(1e-6, 1.0 - w_eff) * (1.0 + (max(0.0, dev - dd) / dg) ** 2) + (DYN_RES * d) ** 2
-        return z, h, r, z - d, pred
+        return z, h, r, z - d, pred          # z - d: the reading without the swing (still with the board error)
 
     def _model(self, t, prev, x):
         """(camera fused?, q, qb, coast) for predicting from history entry prev to time t."""
@@ -349,7 +355,7 @@ class KneeFilter:
             # re-derive b from the accel reading at that time.
             theta, omega = fit
             z_acc = H[i - 1][7] if H[i - 1][7] is not None else self.z_acc
-            x = [theta, omega, 0.0, (z_acc - theta) if self.w_eff < 1.0 else x[3]]
+            x = [theta, omega, 0.0, (z_acc - theta - self._cmap(theta)[0]) if self.w_eff < 1.0 else x[3]]
             P = self._p0(r, r + R_ACC0)
             P[1][1], P[2][2] = 30.0 ** 2, 300.0 ** 2
             e[1], e[3] = 2, None                          # a reset entry: replays keep it
@@ -361,6 +367,19 @@ class KneeFilter:
                 # frames at rest where timing errors do not matter. Clipped so outliers count only a little.
                 v = min(nu * nu, (GATE * GATE / 4.0) * s) - P[0][0]
                 self.cam_var += CAM_VAR_GAIN * (max(0.0, v) - self.cam_var)
+            z_acc = H[i - 1][7]
+            if CMAP_GAIN > 0.0 and self.w_eff < 1.0 and abs(x[1]) < CMAP_SPEED and z_acc is not None:
+                # The accelerometers' error (zero-g offsets, gains, mounting) is a smooth function of the knee
+                # angle that b, a constant, cannot follow from one hold to the next. While the camera watches a
+                # still knee, learn it (normalised LMS on sin/cos of theta and 2 theta); it then also corrects
+                # the accelerometers when the camera drops out.
+                th = x[0] + nu
+                err = (z_acc - x[3] - self._cmap(th)[0]) - th
+                if abs(err) < CMAP_MAX_ERR:
+                    a = math.radians(th)
+                    ph_ = (math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a))
+                    k_ = CMAP_GAIN * err / (sum(f * f for f in ph_) + 1e-6)
+                    self.cmap = [c + k_ * f for c, f in zip(self.cmap, ph_)]
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
             e[4:] = [x, P, H[i - 1][6], H[i - 1][7]]
@@ -394,10 +413,21 @@ class KneeFilter:
         x, _ = _predict(self.x, self.P, t - self.t, 0.0, 0.0, True)
         return self.euro.peek(t, x[0], x[1], self.fmin, self.beta), x[1]
 
+    def _cmap(self, theta):
+        """Learned accelerometer error at knee angle theta and its slope: (deg, deg/deg)."""
+        c = self.cmap
+        if not any(c):
+            return 0.0, 0.0
+        a = math.radians(theta)
+        s1, c1, s2, c2 = math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a)
+        return (c[0] * s1 + c[1] * c1 + c[2] * s2 + c[3] * c2,
+                math.radians(c[0] * c1 - c[1] * s1 + 2 * c[2] * c2 - 2 * c[3] * s2))
+
     def _rebase(self, k_new, theta_now):
         """New accel reference: theta := theta_now, b := 0, history restarts (snap the display)."""
         if self.x is None:
             return
+        self.cmap = [0.0] * 4          # learned against the old reference
         self.k = k_new
         self.x = [theta_now, self.x[1], self.x[2], 0.0]
         P = [row[:] for row in self.P]

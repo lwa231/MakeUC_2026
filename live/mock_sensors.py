@@ -51,7 +51,10 @@ DEFAULTS = dict(
     mirror=False,                       # boards turned 180 deg about the limb (right leg): bend sign flips
     hw_seed=None,                       # seed for the board/mounting draw (default: seed)
     stall_rate=0.2, stall=(0.01, 0.04),  # host stalls (per s, s): lines then arrive in a burst
-    cam_noise=1.5,                      # camera angle noise, sd (deg), plus 0.01 deg per deg/s of motion
+    cam_noise=0.3,                      # camera angle noise, sd (deg), plus 0.003 deg per deg/s of motion
+    cam_bias=(0.7, 3.0, 2.0),           # sd of the camera's angle-dependent bias a + b u + c u^2, u = knee/90 (deg);
+                                        #   one draw per run (view angle, marker tilt; measured with sim_camera.py)
+    cam_blur_speed=300.0,               # frames are lost to motion blur with probability (speed/this)^2
     cam_lat=(0.06, 0.12),               # capture -> file arrival latency (s)
     cam_fps=30.0,                       # camera frame rate (the panel's Tk loop may deliver fewer)
     cam_stamp=(0.02, 0.07),             # t_cap is stamped when read() returns, this much after the exposure:
@@ -70,7 +73,8 @@ SCENARIOS = {
     "default": {},
     "fast": dict(t_move=(0.5, 0.8), hold_top=(0.1, 0.4), hold_bot=(0.2, 0.6)),
     "slow": dict(t_move=(2.5, 4.5), hold_top=(1.0, 2.0), hold_bot=(1.0, 2.0)),
-    "badcam": dict(cam_noise=3.0, cam_lat=(0.10, 0.20), cam_drop=0.2, cam_lost_rate=1 / 6.0, cam_outlier=0.04),
+    "badcam": dict(cam_noise=3.0, cam_lat=(0.10, 0.20), cam_drop=0.2, cam_lost_rate=1 / 6.0, cam_outlier=0.04,
+                   cam_bias=(1.5, 6.0, 4.0)),
     # seated, thigh supported; boards already bench-checked, so offset/gain are corrected and true_k is exact
     "calib": dict(script="calib", sway=0.25, offset=0.0, gain=0.0),
 }
@@ -222,6 +226,7 @@ def cam_stream(p, truth, rng):
     exposure time t; t_stamp (what the camera code reports as t_cap) is later by an unknown delay."""
     t, prev, lost_until = 0.2, 0.0, -1.0
     stamp = rng.uniform(*p["cam_stamp"])
+    bias = [rng.gauss(0.0, sd) for sd in p["cam_bias"]]
     while True:
         t += (2 if rng.random() < 0.1 else 1) / p["cam_fps"] + rng.gauss(0.0, 0.002)   # ~10% of frames come late
         arr = prev = max(t + rng.uniform(*p["cam_lat"]) + rng.gauss(0.0, 0.005), prev + 0.001)
@@ -229,9 +234,11 @@ def cam_stream(p, truth, rng):
         if rng.random() < p["cam_lost_rate"] / 30.0:
             lost_until = t + rng.uniform(*p["cam_lost"])
         knee = None
-        if t >= lost_until and rng.random() >= p["cam_drop"]:
-            ang, rate, _ = truth.motion(t)
-            knee = ang + rng.gauss(0.0, p["cam_noise"] + 0.01 * abs(rate))
+        ang, rate, _ = truth.motion(t)
+        blur = min(0.9, (rate / p["cam_blur_speed"]) ** 2) if p["cam_blur_speed"] else 0.0
+        if t >= lost_until and rng.random() >= p["cam_drop"] and rng.random() >= blur:
+            u = ang / 90.0
+            knee = ang + bias[0] + bias[1] * u + bias[2] * u * u + rng.gauss(0.0, p["cam_noise"] + 0.003 * abs(rate))
             if rng.random() < p["cam_outlier"]:
                 knee += rng.choice((-1, 1)) * rng.uniform(10.0, 30.0)
         yield arr, t_stamp, knee

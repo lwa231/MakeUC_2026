@@ -31,6 +31,8 @@ FPS, LAT, STAMP, CAM_MIN_CONF = 30.0, (0.06, 0.12), (0.02, 0.07), 0.5
 
 
 def cam_hash():
+    if os.environ.get("E2E_HASH"):          # reuse frames rendered with an earlier camera_origin.py
+        return os.environ["E2E_HASH"]
     return hashlib.sha1(open(os.path.join(ROOT, "camera_origin.py"), "rb").read()).hexdigest()[:10]
 
 
