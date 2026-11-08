@@ -129,10 +129,10 @@ Other checks:
 
   | | Original | New |
   |---|---|---|
-  | Fused rms, last minute | 2.4–5.5° | 2.0–4.6° |
-  | Accel-only rms after the camera is lost | 3.0–4.7° | 2.0–4.8° (better on 3 of 4 seeds) |
+  | Fused rms, last minute | 2.4–5.5° | 2.2–4.4° |
+  | Accel-only rms after the camera is lost | 3.0–4.7° | 1.8–4.5° (better on 3 of 4 seeds) |
 
-  The learned error map stays small (|c| ≤ 4°).
+  The learned error map stays small (|c| ≤ 3°).
 
 ## Review loop
 Three independent Sonnet reviews of the diff; every substantiated finding was fixed:
