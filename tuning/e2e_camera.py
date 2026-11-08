@@ -130,9 +130,15 @@ def table(res, ws):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
+    ap.add_argument("--w", type=float, action="append")
+    a = ap.parse_args()
+    ov = {k: float(v) for k, v in (x.split("=", 1) for x in a.set)}
     build_cache()
-    ws = (FB.KE.W_DEFAULT, 0.0, 1.0)
-    print(table(bench(ws), ws))
+    ws = a.w or [FB.KE.W_DEFAULT, 0.0, 1.0]
+    print(table(bench(ws, ov), ws))
 
 
 if __name__ == "__main__":

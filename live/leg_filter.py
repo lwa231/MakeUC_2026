@@ -76,6 +76,7 @@ class LegFilter:
             self.mapping, old = (inv, rot, k), self.kf
             self.kf = KneeFilter(old.w, old.resp)     # the raw angle jumped: start afresh
             self.kf.set(src=old.src)
+            self.kf.cam_delay, self.kf.cam_var = old.cam_delay, old.cam_var   # the camera did not change
             if k is not None:
                 self.kf.set_reference(k)
             self.reset = True
@@ -225,7 +226,7 @@ class LegFilter:
             calibrate.save(self.paths[".stats"], {
                 "rate": self.n_acc / dt, "cam_hz": self.n_cam / dt, "wall": time.time(),
                 "fusion": "locked" if kf.cam_ok else ("waiting" if kf.w_eff > 0 else "off"),
-                "offset_deg": None if kf.x is None else kf.x[2], "w": kf.w, "resp": kf.resp,
+                "offset_deg": None if kf.x is None else kf.x[3], "w": kf.w, "resp": kf.resp,
                 "src": kf.src, "cal": dict(cal, calibrated=kf.calibrated)})
         except OSError:
             pass

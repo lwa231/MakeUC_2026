@@ -22,6 +22,7 @@ R_CAM0 = 11.0         # (tuned) floor of the camera variance per frame at w = 1 
 DEV_G = 0.2           # (tuned) accel R grows by (dev/DEV_G)^2, dev = ||a| - 1 g| beyond DEAD_G and the swing
 DEAD_G = 0.0          # (tuned) |a| error ignored as noise / zero-g offset (g)
 Q_B = 0.03            # random walk of b while the camera is fused (deg^2/s): strap slip (tuning/ slip scenario)
+Q_BW = 0.0            # ... plus this per degree of knee travel (deg^2/deg): board error changes with the angle
 Q_J0 = 1.2e6          # (tuned) white jerk density at resp = 0.5 (deg^2/s^5)
 ALPHA_TAU = 0.075     # (tuned) angular acceleration decorrelates over this time (s)
 Q_CAM_A = 3000.0      # camera only: white angular-acceleration density at resp = 0.5 (deg^2/s^3)
@@ -62,6 +63,7 @@ CAM_DELAY_STEP = 0.06 # one frame's delay error estimate is clipped to this (s)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
+CONF_POW = 2.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
 CAM_H = (1.0, 0.0, 0.0, 0.0)  # camera row: camera = theta (accel = theta + b + swing, see _accel_z)
 N = 4
 
@@ -235,18 +237,23 @@ class KneeFilter:
         r = r0 / max(1e-6, 1.0 - w_eff) * (1.0 + (max(0.0, dev - dd) / dg) ** 2) + (DYN_RES * d) ** 2
         return z, h, r, z - d, pred
 
+    def _model(self, t, prev, x):
+        """(camera fused?, q, qb, coast) for predicting from history entry prev to time t."""
+        camera_fused = self.w_eff > 0.0 and t - self.t_cam < CAM_OK_S
+        coast = t - prev[6] > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
+        q = self.q if camera_fused or self.q < 0.0 else self.q_acc
+        qb = (Q_B + Q_BW * abs(x[1])) if camera_fused else 0.0
+        return camera_fused, q, qb, coast
+
     def _step(self, x, P, prev, e):
         """Advance (x, P) from history entry prev to entry e and apply e's measurement (fills e[4:])."""
         t, kind = e[0], e[1]
         if kind == 2:                                 # camera relock: a reset, not a measurement
             e[6] = prev[6]
             return e[4], e[5]
-        dt = t - prev[0]
-        camera_fused = self.w_eff > 0.0 and t - self.t_cam < CAM_OK_S
-        coast = t - prev[6] > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
-        qb = Q_B if camera_fused else 0.0
-        x, P = _predict(x, P, dt, self.q if camera_fused or self.q < 0.0 else self.q_acc, qb, coast)
-        z = None
+        camera_fused, q, qb, coast = self._model(t, prev, x)
+        x, P = _predict(x, P, t - prev[0], q, qb, coast)
+        z = prev[7]                                   # camera entries carry the last accel reading along
         if kind == 0:
             # the camera share only discounts the accelerometers while camera frames are actually fused
             zm, h, r, z, pred = self._accel_z(x, e[2], self.w_eff if camera_fused else 0.0, camera_fused)
@@ -275,6 +282,8 @@ class KneeFilter:
 
     def accel(self, t, v6):
         """One accelerometer sample at time t. Returns the display (theta, omega)."""
+        if not all(math.isfinite(v) for v in v6[:6]):
+            return (self.euro.y, self.x[1]) if self.x is not None else (0.0, 0.0)
         tau_t = tilt(v6[0], v6[1])
         m = (tau_t, v6[3], v6[4], v6[5], abs(math.sqrt(v6[0] ** 2 + v6[1] ** 2 + v6[2] ** 2) - 1.0))
         if self.x is None:
@@ -283,8 +292,8 @@ class KneeFilter:
             self.t_acc, self.z_acc = t, z
             self.hist = [[t, 0, m, None, self.x, self.P, t, z]]
             return self.euro(t, z, 0.0, self.fmin, self.beta), 0.0
-        if t <= self.t:
-            return self.euro.y, self.x[1]       # out-of-order or duplicate stamp
+        if t <= self.t or not all(math.isfinite(v) for v in v6[:6]):
+            return self.euro.y, self.x[1]       # out-of-order or duplicate stamp, or a corrupt sample
         e = [t, 0, m, None, None, None, None, None]
         self.x, self.P = self._step(self.x, self.P, self.hist[-1], e)
         self.t, self.t_acc, self.z_acc = t, t, e[7]
@@ -304,18 +313,23 @@ class KneeFilter:
     def camera(self, t_cap, knee, conf=1.0):
         """One camera knee angle stamped t_cap (its true exposure is ~cam_delay earlier, up to HIST_S
         old). conf (0..1) scales its weight. Returns True if it was used."""
-        if knee is None or self.x is None or self.w_eff <= 0.0:
+        if knee is None or self.x is None or self.w_eff <= 0.0 or not math.isfinite(knee + t_cap):
             return False
         H = self.hist
-        t = min(t_cap - self.cam_delay, self.t)          # never ahead of the accel stream
+        t = t_cap - self.cam_delay
+        if t > self.t + GAP_S:
+            return False      # the accelerometers have gone quiet: frames would pile up at one instant
+        t = min(t, self.t)                               # never ahead of the accel stream
         i = len(H)
         while i > 0 and H[i - 1][0] > t:
             i -= 1
         if i == 0:
             return False                                  # older than the history
-        r = max(R_CAM0, self.cam_var) / self.w_eff / max(0.5, min(1.0, conf if conf is not None else 1.0)) ** 2
+        conf = 1.0 if conf is None or not math.isfinite(conf) else max(0.5, min(1.0, conf))
+        r = max(R_CAM0, self.cam_var) / self.w_eff / conf ** CONF_POW
         e = [t, 1, knee, r, None, None, None, None]
-        x, P = _predict(H[i - 1][4], H[i - 1][5], t - H[i - 1][0], self.q, 0.0, t - H[i - 1][6] > GAP_S)
+        _, q, qb, coast = self._model(t, H[i - 1], H[i - 1][4])
+        x, P = _predict(H[i - 1][4], H[i - 1][5], t - H[i - 1][0], q, qb, coast)
         nu = wrap(knee - x[0])
         s = P[0][0] + r
         if self.w_eff < 1.0 and abs(x[1]) > CAM_DELAY_SPEED and nu * nu < (2.0 * GATE) ** 2 * s:
@@ -325,7 +339,7 @@ class KneeFilter:
             err = max(-CAM_DELAY_STEP, min(CAM_DELAY_STEP, -nu / x[1]))
             wt = x[1] * x[1] / (x[1] * x[1] + 100.0 ** 2)
             self.cam_delay = max(0.0, min(CAM_DELAY_MAX, self.cam_delay + CAM_DELAY_GAIN * wt * err))
-        if nu * nu > GATE * GATE * s:
+        if not nu * nu <= GATE * GATE * s:
             self.rej = [f for f in self.rej if t - RELOCK_S <= f[0] < t] + [(t, x[0] + nu)]
             fit = self._line(self.rej) if len(self.rej) >= RELOCK_N else None
             if fit is None:
@@ -339,7 +353,7 @@ class KneeFilter:
             P = self._p0(r, r + R_ACC0)
             P[1][1], P[2][2] = 30.0 ** 2, 300.0 ** 2
             e[1], e[3] = 2, None                          # a reset entry: replays keep it
-            e[4:] = [x, P, H[i - 1][6], None]
+            e[4:] = [x, P, H[i - 1][6], H[i - 1][7]]
             self.rej, self.n_relock = [], self.n_relock + 1
         else:
             if abs(x[1]) < CAM_VAR_SPEED:
@@ -349,7 +363,7 @@ class KneeFilter:
                 self.cam_var += CAM_VAR_GAIN * (max(0.0, v) - self.cam_var)
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
-            e[4:] = [x, P, H[i - 1][6], None]
+            e[4:] = [x, P, H[i - 1][6], H[i - 1][7]]
             self.rej = []
         self.t_cam = max(self.t_cam, t)
         H.insert(i, e)

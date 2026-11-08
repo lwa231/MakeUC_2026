@@ -62,7 +62,7 @@ class Demo(unittest.TestCase):
     def test_camera_only_relock_keeps_offset_sane(self):
         run = mock_sensors.generate("badcam", seed=1, duration=30.0)
         _, kf = run_filter(run, w=1.0)
-        self.assertLess(abs(kf.x[2]), 15.0)                       # b stays usable for a switch to fused
+        self.assertLess(abs(kf.x[3]), 15.0)                       # b stays usable for a switch to fused
 
     def test_calibration(self):
         for seed, kw in ((1, {}), (2, {"mirror": True, "mount": 100.0}), (3, {"deficit_deg": 15.0, "mount": 100.0})):
@@ -86,7 +86,8 @@ class Demo(unittest.TestCase):
         for i in range(200):
             th, _ = kf.accel(i * 0.01, v6(min(140.0, i * 1.0)))
         self.assertAlmostEqual(kf.x[0], 140.0, delta=3.0)
-        self.assertTrue(kf.camera(2.5, 140.0))           # stamped 0.5 s ahead of the newest sample
+        self.assertFalse(kf.camera(2.5 + kf.cam_delay, 140.0))  # 0.5 s ahead: the accel stream is silent
+        self.assertTrue(kf.camera(2.02 + kf.cam_delay, 140.0))  # stamped a bit ahead of the newest sample
         kf.accel(2.0, v6(140.0))
         self.assertEqual(kf.t_acc, 2.0)                  # the next sample was still used
 
