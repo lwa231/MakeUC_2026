@@ -13,18 +13,19 @@ clock (time.monotonic()); nothing in here reads a clock. Standard library only.
 """
 import math
 
+# Constants marked (tuned) were fitted with tuning/optimize.py on the mock (tuning/fusion_bench.py scenarios,
+# train seeds) and checked on held-out seeds; see tuning/TUNING_NOTES.md.
 W_DEFAULT = 0.75      # camera share of trust (0 = accelerometers only, 1 = camera only): camera leads
 RESP_DEFAULT = 0.5    # responsiveness 0..1: higher follows faster, lower is smoother at rest
-R_ACC0 = 4.0          # accel knee variance per 100 Hz sample at w = 0 (deg^2); 6-bit steps are 2.7 deg
-R_CAM0 = R_ACC0 * 0.3 # camera variance per 30 Hz frame at w = 1, so w = 0.5 is equal information
-DEV_G = 0.05          # accel R grows by (dev/DEV_G)^2 with dev = ||a| - 1 g| beyond DEAD_G (motion)
-DEAD_G = 0.04         # |a| error ignored as noise / zero-g offset (g)
-Q_B = 0.5 ** 2        # random walk of b while the camera is fused (deg^2/s): strap slip
-Q_BW = 0.02           # ... plus this per degree of knee travel (deg^2/deg): board error varies with angle
-Q_J0 = 2.0e6          # white jerk density at resp = 0.5 (deg^2/s^5)
-ALPHA_TAU = 0.25      # angular acceleration decorrelates over this time (s)
+R_ACC0 = 1.7          # (tuned) accel knee variance per 100 Hz sample at w = 0 (deg^2)
+R_CAM0 = 11.0         # (tuned) floor of the camera variance per frame at w = 1 (deg^2); also learned (cam_var)
+DEV_G = 0.2           # (tuned) accel R grows by (dev/DEV_G)^2, dev = ||a| - 1 g| beyond DEAD_G and the swing
+DEAD_G = 0.0          # (tuned) |a| error ignored as noise / zero-g offset (g)
+Q_B = 0.03            # random walk of b while the camera is fused (deg^2/s): strap slip (tuning/ slip scenario)
+Q_J0 = 1.2e6          # (tuned) white jerk density at resp = 0.5 (deg^2/s^5)
+ALPHA_TAU = 0.075     # (tuned) angular acceleration decorrelates over this time (s)
 Q_CAM_A = 3000.0      # camera only: white angular-acceleration density at resp = 0.5 (deg^2/s^3)
-GATE = 4.0            # reject camera frames whose innovation exceeds this many sigma
+GATE = 3.0            # (tuned) reject camera frames whose innovation exceeds this many sigma
 RELOCK_N = 3          # ... unless this many rejected frames
 RELOCK_S = 0.4        # ... within this long
 RELOCK_SD = 3.0       # ... lie on a line to within this (deg): then the camera is right, relock to it
@@ -33,18 +34,30 @@ GAP_S = 0.05          # accel silence that starts coasting (s)
 COAST_TAU = 0.2       # while coasting omega decays with this time constant (s)
 CAM_STALE_S = 0.3     # camera-only: no accepted frame for this long also coasts (s)
 CAM_OK_S = 0.5        # cam_ok while a frame was accepted this recently (s)
-EURO_FMIN = (0.1, 0.4)  # display (One Euro) cutoff at rest: a + b * resp (Hz)
-EURO_BETA = (0.1, 0.4)  # ... plus this (a + b * resp, Hz) per deg/s of speed
+EURO_FMIN = (0.033, 0.133)  # (tuned) display (One Euro) cutoff at rest: a + b * resp (Hz)
+EURO_BETA = (0.035, 0.14)   # (tuned) ... plus this (a + b * resp, Hz) per deg/s of speed
+# Without camera frames (no webcam, markers lost, src = accel) the accelerometers are on their own and want
+# a calmer model and display than when the camera steadies the estimate:
+# a constant-velocity model like the original (pre-rework) filter, which tuning/ablate_accel.py found best
+# without a camera (the swing model needs a good alpha, which only the camera-steadied model has), retuned.
+Q_ACC_A = 6000.0      # (tuned) white angular-acceleration density at resp = 0.5, no camera (deg^2/s^3)
+R_ACC0_ACC = 5.7      # (tuned) accel knee variance per sample, no camera (deg^2)
+DEV_G_ACC, DEAD_G_ACC = 0.084, 0.0275   # (tuned) |a| weighting, no camera (g)
+BLIP_SIGMA_ACC = 3.0  # jolt threshold, no camera
+SWING_ACC = 0         # swing model without camera: 0 off, 1 centripetal only (omega^2; alpha is not estimated)
+EURO_FMIN_ACC = (0.033, 0.133)  # (tuned) display cutoff at rest, no camera (Hz)
+EURO_BETA_ACC = (0.071, 0.283)  # (tuned) display speed slope, no camera
+OMEGA_LIM, ALPHA_LIM = 1500.0, 30000.0   # hard state limits (deg/s, deg/s^2): a guard, never reached by a leg
 SPEED_DEAD = 5.0      # display: speeds below this (deg/s) count as rest noise
-BLIP_SIGMA = 3.0      # accel samples further than this from the prediction are jolts: down-weighted
+BLIP_SIGMA = 2.2      # (tuned) accel samples further than this from the prediction are jolts: down-weighted
 G = 9.80665           # m/s^2
 R_SHANK_M = 0.118     # hinge -> shank sensor pocket centre (hardware/brace/brace.py sensor_pos)
 OMEGA_MAX = 600.0     # the swing model trusts at most this knee speed (deg/s) ...
 ALPHA_MAX = 4000.0    # ... and acceleration (deg/s^2); a brisk 90 deg rep in 0.5 s peaks near 2100
-DYN_RES = 0.3         # share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
+DYN_RES = 0.06        # (tuned) share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
 CAM_DELAY0 = 0.04     # first guess of exposure -> t_cap (s); learned while the knee moves
 CAM_DELAY_MAX = 0.25
-CAM_DELAY_GAIN = 0.03 # learning rate of the camera delay (per frame in motion)
+CAM_DELAY_GAIN = 0.17 # (tuned) learning rate of the camera delay (per frame in motion)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
@@ -68,9 +81,9 @@ def raw_knee(v6):
     return wrap(tilt(v6[3], v6[4]) - tilt(v6[0], v6[1]))
 
 
-def q_from_resp(resp):
+def q_from_resp(resp, q0=None):
     """Responsiveness 0..1 -> white jerk density (deg^2/s^5); x100 per +1."""
-    return Q_J0 * 10.0 ** (2.0 * (resp - 0.5))
+    return (Q_J0 if q0 is None else q0) * 10.0 ** (2.0 * (resp - 0.5))
 
 
 def _predict(x, P, dt, q, qb, coast):
@@ -171,15 +184,25 @@ class KneeFilter:
         # camera only: nothing between the 30 Hz frames, so a jerk model would overshoot every stop;
         # use constant velocity instead (q < 0 flags it: white acceleration density -q)
         self.q = -Q_CAM_A * 10.0 ** (2.0 * (self.resp - 0.5)) if self.w_eff >= 1.0 else q_from_resp(self.resp)
-        self.fmin = EURO_FMIN[0] + EURO_FMIN[1] * self.resp    # display cutoff at rest (Hz)
-        self.beta = EURO_BETA[0] + EURO_BETA[1] * self.resp    # extra cutoff (Hz) per deg/s of speed
+        self.q_acc = -Q_ACC_A * 10.0 ** (2.0 * (self.resp - 0.5))   # no camera frames: constant velocity
+        self.euro_cam = (EURO_FMIN[0] + EURO_FMIN[1] * self.resp,      # display cutoff at rest (Hz)
+                         EURO_BETA[0] + EURO_BETA[1] * self.resp)      # extra cutoff (Hz) per deg/s of speed
+        self.euro_acc = (EURO_FMIN_ACC[0] + EURO_FMIN_ACC[1] * self.resp, EURO_BETA_ACC[0] + EURO_BETA_ACC[1] * self.resp)
+
+    @property
+    def fmin(self):
+        return (self.euro_cam if self.cam_ok else self.euro_acc)[0]
+
+    @property
+    def beta(self):
+        return (self.euro_cam if self.cam_ok else self.euro_acc)[1]
 
     @property
     def cam_ok(self):
         return self.t is not None and self.w_eff > 0.0 and self.t - self.t_cam < CAM_OK_S
 
     # ---- measurement models ----
-    def _accel_z(self, x, m, w_eff=None):
+    def _accel_z(self, x, m, w_eff=None, fused=True):
         """Accel measurement for state x: (z, h, r, zc). z = raw knee - k (unwrapped near the prediction),
         h = its linearised row, r = its variance, zc = z with the modelled swing removed (theta + b).
 
@@ -191,7 +214,9 @@ class KneeFilter:
         tau_t, sx, sy, sz, dev_t = m
         th = math.radians(x[0])
         w = math.radians(max(-OMEGA_MAX, min(OMEGA_MAX, x[1])))
-        a = math.radians(max(-ALPHA_MAX, min(ALPHA_MAX, x[2])))
+        a = math.radians(max(-ALPHA_MAX, min(ALPHA_MAX, x[2]))) if fused or SWING_ACC > 1 else 0.0
+        if not fused and not SWING_ACC:
+            w = 0.0
         c, sn = math.cos(th), math.sin(th)
         kr = self.r_shank / G
         d = math.degrees(kr * (w * w * c + a * sn))
@@ -205,8 +230,8 @@ class KneeFilter:
         norm = math.sqrt(sx * sx + sy * sy + sz * sz) - 1.0 - kr * (w * w * sn - a * c)
         dev = max(dev_t, abs(norm))
         w_eff = self.w_eff if w_eff is None else w_eff
-        r = (R_ACC0 / max(1e-6, 1.0 - w_eff) * (1.0 + (max(0.0, dev - DEAD_G) / DEV_G) ** 2)
-             + (DYN_RES * d) ** 2)
+        r0, dg, dd = (R_ACC0, DEV_G, DEAD_G) if fused else (R_ACC0_ACC, DEV_G_ACC, DEAD_G_ACC)
+        r = r0 / max(1e-6, 1.0 - w_eff) * (1.0 + (max(0.0, dev - dd) / dg) ** 2) + (DYN_RES * d) ** 2
         return z, h, r, z - d, pred
 
     def _step(self, x, P, prev, e):
@@ -218,18 +243,21 @@ class KneeFilter:
         dt = t - prev[0]
         camera_fused = self.w_eff > 0.0 and t - self.t_cam < CAM_OK_S
         coast = t - prev[6] > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
-        qb = (Q_B + Q_BW * abs(x[1])) if camera_fused else 0.0
-        x, P = _predict(x, P, dt, self.q, qb, coast)
+        qb = Q_B if camera_fused else 0.0
+        x, P = _predict(x, P, dt, self.q if camera_fused or self.q < 0.0 else self.q_acc, qb, coast)
         z = None
         if kind == 0:
             # the camera share only discounts the accelerometers while camera frames are actually fused
-            zm, h, r, z, pred = self._accel_z(x, e[2], self.w_eff if camera_fused else 0.0)
+            zm, h, r, z, pred = self._accel_z(x, e[2], self.w_eff if camera_fused else 0.0, camera_fused)
             if self.w_eff < 1.0:
                 zl = zm - pred + sum(h[k] * x[k] for k in range(N))     # linearised about x
                 ph, s, nu = _innovation(x, P, h, zl, r)
-                if nu * nu > BLIP_SIGMA ** 2 * s:     # jolt, not a real angle change (Huber)
-                    ph, s, nu = _innovation(x, P, h, zl, r * nu * nu / (BLIP_SIGMA ** 2 * s))
+                bs = BLIP_SIGMA if camera_fused else BLIP_SIGMA_ACC
+                if nu * nu > bs * bs * s:             # jolt, not a real angle change (Huber)
+                    ph, s, nu = _innovation(x, P, h, zl, r * nu * nu / (bs * bs * s))
                 x, P = _update(x, P, ph, s, nu)
+                if abs(x[1]) > OMEGA_LIM or abs(x[2]) > ALPHA_LIM:    # guard: never let the state run away
+                    x = [x[0], max(-OMEGA_LIM, min(OMEGA_LIM, x[1])), max(-ALPHA_LIM, min(ALPHA_LIM, x[2])), x[3]]
         elif e[3] is not None:
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + wrap(e[2] - x[0]), e[3])
             x, P = _update(x, P, ph, s, nu)

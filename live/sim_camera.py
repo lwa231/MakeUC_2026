@@ -397,27 +397,33 @@ class Scenario:
     fps: float = 30.0
     rep_period: float = 2.5     # s per flexion/extension cycle
     seq_range: tuple = (5.0, 95.0)
+    mount: str = "leg"          # "leg": markers stuck on a curved leg (tilt ~3 deg sd, depth +-3.5 cm);
+                                # "brace": rigid brace (knee cap + flat bars): tilt <= 1.5 deg, depth <= 1 cm
 
     def key(self):
         return "%dx%d d%.1f v%d %s" % (self.res[0], self.res[1], self.dist, self.view, self.light)
 
 
-def make_scenarios(quick: bool = False, n: Optional[int] = None) -> List[Scenario]:
+def make_scenarios(quick: bool = False, n: Optional[int] = None, mount: str = "leg") -> List[Scenario]:
     n = n or (10 if quick else 48)
     sc = []
     for res, dist, view, light in itertools.product([(640, 480), (1280, 720)], [0.7, 1.0, 1.5],
                                                     [0, 10, 20], ["good", "dim"]):
-        sc.append(Scenario(res=res, dist=dist, view=view, light=light, n=n))
+        sc.append(Scenario(res=res, dist=dist, view=view, light=light, n=n, mount=mount))
     sc.append(Scenario(res=(1280, 720), dist=1.0, view=10, light="good", occl_prob=1.0, n=max(6, n // 2),
-                       name="occlusion"))
+                       name="occlusion", mount=mount))
     return sc
 
 
 def sample_pose(s: Scenario, k: int, rng) -> Pose:
     u = rng.uniform
     theta = u(*s.theta_range)
-    tilt = {nm: (u(0, 360), float(np.clip(rng.normal(0, 3.0), -7, 7))) for nm in IDS}
-    dz = {nm: u(-3.5, 3.5) for nm in IDS}
+    if s.mount == "brace":
+        tilt = {nm: (u(0, 360), float(np.clip(rng.normal(0, 0.7), -1.5, 1.5))) for nm in IDS}
+        dz = {nm: u(-1.0, 1.0) for nm in IDS}
+    else:
+        tilt = {nm: (u(0, 360), float(np.clip(rng.normal(0, 3.0), -7, 7))) for nm in IDS}
+        dz = {nm: u(-3.5, 3.5) for nm in IDS}
     occl = None
     if s.occl_prob and rng.random() < s.occl_prob:
         occl = (str(rng.choice(["hip", "ankle", "knee"])), float(u(0.7, 1.0)))
@@ -435,14 +441,14 @@ def sample_cam(s: Scenario, rng) -> Cam:
                yaw=yaw, pitch=pitch, k1=s.k1, flip_x=s.flip_x)
 
 
-def make_sequences(frames: int = 150) -> List[Scenario]:
+def make_sequences(frames: int = 150, mount: str = "leg") -> List[Scenario]:
     """Static-camera sequences (leg doing reps) for testing temporal behaviour; evaluate(..., fresh=False)."""
     out = []
     for res, dist, view, light in itertools.product([(1280, 720), (640, 480)], [1.0, 1.5], [0, 10, 20], ["good", "dim"]):
         if light == "dim" and (res[0] == 640 or dist > 1.0):
             continue
         out.append(Scenario(res=res, dist=dist, view=view, light=light, n=frames, seq=True,
-                            name="seq"))
+                            name="seq", mount=mount))
     return out
 
 
@@ -751,6 +757,7 @@ def main(argv=None):
     ap.add_argument("-n", type=int, default=None, help="samples per scenario (36 scenarios + occlusion)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--mount", choices=["leg", "brace"], default="leg", help="marker mounting model")
     ap.add_argument("--seq", action="store_true", help="static-camera rep sequences (temporal behaviour) instead of the sweep")
     ap.add_argument("--factory", help="module:callable returning a tracker (factory(flip_x=False)); "
                                       "evaluated side by side with the original")
@@ -761,7 +768,7 @@ def main(argv=None):
     if a.dump:
         dump(a.dump, a.seed)
         return 0
-    scen = make_sequences(60 if a.quick else (a.n or 150)) if a.seq else make_scenarios(quick=a.quick, n=a.n)
+    scen = make_sequences(60 if a.quick else (a.n or 150), a.mount) if a.seq else make_scenarios(quick=a.quick, n=a.n, mount=a.mount)
     nfr = sum(s.n for s in scen)
     print("sim_camera: %d scenarios, %d frames, seed %d%s" % (len(scen), nfr, a.seed, " (quick)" if a.quick else ""))
     t0 = time.time()

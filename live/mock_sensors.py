@@ -62,7 +62,8 @@ DEFAULTS = dict(
     script=None,                        # "calib": the Hang and Straighten session, then reps
     hang_err_deg=0.0,                   # calib: shin this far from vertical at the hang
     deficit_deg=5.0,                    # calib: best extension, deg short of straight
-    slip_deg=0.0,                       # calib: shank strap slip while lowering to the re-hang
+    slip_deg=0.0,                       # shank strap slip (deg); calib: while lowering to the re-hang
+    slip_t=None,                        # ... at this time (s; default: SLIP_T, the calib re-hang)
 )
 
 SCENARIOS = {
@@ -200,7 +201,7 @@ def accel_stream(p, hw, truth, rng):
         ts = t + 0.002                          # mid-read
         knee, rate, acc = truth.motion(ts)
         th = thigh_tilt(p, ts)
-        slip = p["slip_deg"] * minjerk((ts - SLIP_T) / 0.2) if p["script"] == "calib" else 0.0
+        slip = p["slip_deg"] * minjerk((ts - (SLIP_T if p["slip_t"] is None else p["slip_t"])) / 0.2)
         w, alpha = math.radians(rate), math.radians(acc)
         # Shank lever arm: centripetal r*w^2 along x (toward the knee), tangential r*alpha against z.
         v6 = (read_board(p, hw, rng, 0, th + hw["mount_th"]) +

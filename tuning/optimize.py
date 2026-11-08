@@ -20,11 +20,15 @@ ACCEL_WEIGHT = 0.5
 SPACE = {
     "Q_J0": (True, 1e4, 1e8), "ALPHA_TAU": (True, 0.03, 2.0), "R_ACC0": (True, 0.5, 30.0),
     "R_CAM0": (True, 0.1, 20.0), "DEV_G": (True, 0.01, 0.5), "DEAD_G": (False, 0.0, 0.2),
-    "Q_B": (True, 0.001, 20.0), "Q_BW": (True, 1e-4, 1.0), "GATE": (False, 2.5, 8.0),
+    "Q_B": (True, 0.001, 20.0), "GATE": (False, 2.5, 8.0),
     "DYN_RES": (False, 0.0, 1.0), "BLIP_SIGMA": (False, 1.5, 8.0), "CAM_DELAY_GAIN": (True, 0.002, 0.3),
     "EURO_FMIN": (True, 0.1, 5.0), "EURO_BETA": (True, 0.005, 5.0),
+    "Q_ACC_A": (True, 30.0, 1e6), "R_ACC0_ACC": (True, 0.3, 50.0), "DEV_G_ACC": (True, 0.01, 0.5),
+    "DEAD_G_ACC": (False, 0.0, 0.2), "BLIP_SIGMA_ACC": (False, 1.5, 8.0),
+    "EURO_FMIN_ACC": (True, 0.1, 5.0), "EURO_BETA_ACC": (True, 0.005, 5.0),
 }
-TUPLE = {"EURO_FMIN", "EURO_BETA"}   # a + b * resp: the search scales both by one factor
+TUPLE = {"EURO_FMIN", "EURO_BETA", "EURO_FMIN_ACC", "EURO_BETA_ACC"}
+MODE = "both"     # "accel": objective = accel-only J (w = 0) only   # a + b * resp: the search scales both by one factor
 
 
 def current():
@@ -46,6 +50,10 @@ def to_overrides(p):
 
 
 def objective(p, seeds, detail=False):
+    if MODE == "accel":
+        res = FB.bench(seeds, (0.0,), None, to_overrides(p))
+        ja = sum(res[n, 0.0]["J"] for n in FB.SCEN) / len(FB.SCEN)
+        return (ja, 0.0, ja, res) if detail else ja
     res = FB.bench(seeds, (KE.W_DEFAULT, 0.0), None, to_overrides(p))
     jf = sum(res[n, KE.W_DEFAULT]["J"] for n in FB.SCEN) / len(FB.SCEN)
     ja = sum(res[n, 0.0]["J"] for n in FB.SCEN) / len(FB.SCEN)
@@ -58,7 +66,11 @@ def main():
     ap.add_argument("--seeds", default="1,2,3")
     ap.add_argument("--only", help="comma list of parameters to search")
     ap.add_argument("--start", help="json file with a starting parameter set")
+    ap.add_argument("--mode", default="both", choices=("both", "accel"))
+    ap.add_argument("--out", default="best_params.json")
     a = ap.parse_args()
+    global MODE
+    MODE = a.mode
     seeds = tuple(int(s) for s in a.seeds.split(","))
     p = current()
     if a.start:
@@ -89,7 +101,7 @@ def main():
             step[k] = math.sqrt(step[k]) if SPACE[k][0] else step[k] / 2.0
         if not improved and rnd > 0:
             break
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_params.json")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), a.out)
     json.dump(p, open(out, "w"), indent=1)
     print("saved", out)
 

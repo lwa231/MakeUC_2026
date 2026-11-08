@@ -131,12 +131,15 @@ def _inv_sqrt2(M):
     return (v * (1.0 / np.sqrt(w))) @ v.T
 
 
-CONF_K_ANISO, CONF_K_SPREAD, CONF_K_DEV, CONF_K_SMALL, CONF_SIGMA0 = 17.0, 0.5, 5.5, 6.0, 2.5
+CONF_K_ANISO, CONF_K_SPREAD, CONF_K_DEV, CONF_K_SMALL, CONF_SIGMA0 = 12.0, 0.6, 3.6, 4.0, 2.5
+CONF_K_DELTA = 0.9       # deg of error per deg of view correction applied (residual error grows with the correction)
 CONF_QREF = 0.97          # quality of an ideal frame (sigma ~0.5 deg); divides it out so good frames read ~1.0
+HOM_DEADBAND_DEG = 0.15  # corrections (homography vs affine heading) below this are ignored
+HOM_MAX_DEG = 15.0       # larger disagreement with the affine heading = H unreliable, ignored
 VIEW_DEADZONE = 0.03   # ln(axis ratio) of the foreshortening ellipse that is treated as noise (~2% anisotropy)
 
 
-def _view_W(M, dead=None):
+def _view_W(M, dead=None, scale=1.0):
     """W = M^(-1/2), but with the anisotropy soft-thresholded: marker tilt on the curved leg and corner noise
     produce a few % of spurious anisotropy, and 'correcting' that would add error where the view is already
     nearly perpendicular.  M = U diag(e1, e2) U^T (unit det): ln(e1/e2) is shrunk by `dead` before inversion."""
@@ -144,7 +147,7 @@ def _view_W(M, dead=None):
     w, v = np.linalg.eigh(M)
     w = np.maximum(w, 1e-9)
     l = math.log(w[1] / w[0])
-    l2 = math.copysign(max(abs(l) - dead, 0.0), l)
+    l2 = scale * math.copysign(max(abs(l) - dead, 0.0), l)
     e1, e2 = math.exp(-l2 / 2.0), math.exp(l2 / 2.0)      # eigenvalues (w[0], w[1]) of the shrunk unit-det M
     return (v * (1.0 / np.sqrt([e1, e2]))) @ v.T
 
@@ -320,6 +323,14 @@ class CameraTracker:
         self._view_M = None              # smoothed unit-det 2x2 (K K^T), image px
         self._view_t = None
         self._view_jumps = 0
+        self._view_n = 0                 # frames averaged into _view_M (the correction ramps in over view_ramp_n)
+        self.view_ramp_n = 8
+        self.hom_tau_s = 2.0             # EMA time constant of the knee marker's corner shape (homography)
+        self.hom_ramp = (2, 8)          # frames of history before the homography starts / is fully trusted
+        self._hk = None                  # smoothed knee marker corner offsets (4x2, in units of the marker side)
+        self._hk_t = None
+        self._hk_n = 0
+        self._hk_jumps = 0
         self._thigh_hold = None          # (t, thigh heading deg)
         self.debug: dict = {}            # per-frame internals (for the simulator / tuning)
         self.error: Optional[str] = None
@@ -390,6 +401,9 @@ class CameraTracker:
             corners, ids, _ = cv2.aruco.detectMarkers(gray, self._dict, parameters=self._params)
         return corners, ids
 
+    def _ramp(self):
+        return min(1.0, self._view_n / float(max(self.view_ramp_n, 1)))
+
     def _view_matrix(self, found, t):
         """Foreshortening matrix M (unit det, = K K^T up to scale) from the markers seen, smoothed over time
         (the camera does not move relative to the leg plane).  Returns (W, info): W = M^(-1/2) maps image-plane
@@ -401,7 +415,7 @@ class CameraTracker:
         info = {"n": len(items), "dev": 0.0, "jump": False}
         if not items:
             M = self._view_M
-            return (_view_W(M) if M is not None else np.eye(2)), info
+            return (_view_W(M, scale=self._ramp()) if M is not None else np.eye(2)), info
         wts = np.array([w for w, _ in items], float)
         Ss = [S for _, S in items]
 
@@ -419,7 +433,7 @@ class CameraTracker:
             devs = [float(np.linalg.norm(Wm @ Ss[i] @ Wm - np.eye(2))) for i in idx]
         info["dev"] = max(devs) if devs else 0.0
         if self._view_M is None:
-            self._view_M, self._view_t, self._view_jumps = M, t, 0
+            self._view_M, self._view_t, self._view_jumps, self._view_n = M, t, 0, 0
         else:
             Wo = _inv_sqrt2(self._view_M)
             jump = float(np.linalg.norm(Wo @ M @ Wo - np.eye(2)))
@@ -427,7 +441,7 @@ class CameraTracker:
                 info["jump"] = True
                 self._view_jumps += 1
                 if self._view_jumps >= 10:
-                    self._view_M, self._view_t, self._view_jumps = M, t, 0
+                    self._view_M, self._view_t, self._view_jumps, self._view_n = M, t, 0, 0
             else:
                 self._view_jumps = 0
                 dt = min(max(t - (self._view_t if self._view_t is not None else t), 0.0), 1.0)
@@ -436,9 +450,74 @@ class CameraTracker:
                     a *= 0.3                              # one marker is a weaker estimate
                 self._view_M = _unit_det((1.0 - a) * self._view_M + a * M)
                 self._view_t = t
+                self._view_n += 1
         w_, _ = np.linalg.eigh(self._view_M)
         info["aniso"] = abs(math.log(max(w_[1], 1e-9) / max(w_[0], 1e-9)))     # ln axis-ratio^2 of the view ellipse
-        return _view_W(self._view_M), info
+        return _view_W(self._view_M, scale=self._ramp()), info
+
+    def _homography_vectors(self, found, t):
+        """Projective rectification from the knee marker (static, rigid with the brace plane).  The knee marker's
+        4 corners (offsets from its centre, in marker sides) are averaged over time (EMA; reset if they jump, i.e.
+        the camera or the knee moved), re-centred on the current knee marker, and give the plane->image
+        homography H of the known square.  The arm-end marker centres (mean of their H^-1-mapped corners) minus the
+        knee centre are plane vectors; the polar rotation of H's Jacobian at the knee turns them into an
+        image-aligned frame (same convention as the affine W: a common rotation cancels in shank - thigh).
+        Returns (weight, {name: (vx, vy) in cm, image-aligned, y down}) with weight 0..1 = trust (ramps with the
+        number of averaged frames), or (0, {}) when not available."""
+        kn = found.get(self.ids["knee"])
+        if kn is None:
+            return 0.0, {}
+        pts = kn[4]
+        side = kn[1]
+        c = pts.mean(axis=0)
+        off = (pts - c) / max(side, 1e-6)
+        if self._hk is None:
+            self._hk, self._hk_t, self._hk_n, self._hk_jumps = off, t, 1, 0
+        else:
+            jump = float(np.abs(off - self._hk).max())
+            if jump > 0.12:                               # camera / knee moved: keep old shape, restart if persistent
+                self._hk_jumps += 1
+                if self._hk_jumps >= 10:
+                    self._hk, self._hk_t, self._hk_n, self._hk_jumps = off, t, 1, 0
+            else:
+                self._hk_jumps = 0
+                dt = min(max(t - (self._hk_t if self._hk_t is not None else t), 0.0), 1.0)
+                a = max(1.0 - math.exp(-dt / max(self.hom_tau_s, 1e-3)), 1.0 / (self._hk_n + 1))
+                self._hk = (1.0 - a) * self._hk + a * off
+                self._hk_t = t
+                self._hk_n += 1
+        lo, hi = self.hom_ramp
+        w = min(1.0, max(0.0, (self._hk_n - lo) / float(max(hi - lo, 1))))
+        if w <= 0.0:
+            return 0.0, {}
+        src = np.float32([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]])
+        dst = (self._hk * side + c).astype(np.float32)
+        H = cv2.getPerspectiveTransform(src, dst).astype(np.float64)
+
+        def fwd(p):
+            q = H @ np.array([p[0], p[1], 1.0])
+            return q[:2] / q[2]
+        e = 0.25
+        J = np.column_stack([(fwd((e, 0)) - fwd((-e, 0))) / (2 * e), (fwd((0, e)) - fwd((0, -e))) / (2 * e)])
+        U, _, Vt = np.linalg.svd(J)
+        Q = U @ Vt
+        if np.linalg.det(Q) < 0:
+            return 0.0, {}
+        Hn = np.linalg.inv(H)
+
+        def back(xy):
+            q = (Hn @ np.column_stack([xy, np.ones(len(xy))]).T).T
+            return q[:, :2] / q[:, 2:3]
+        pk = back(c[None, :])[0]
+        out = {}
+        for name in ("hip", "ankle"):
+            v = found.get(self.ids.get(name, -2))
+            if v is None:
+                continue
+            pe = back(v[4])
+            vec = Q @ ((pe.mean(axis=0) - pk) * self.marker_cm)
+            out[name] = (float(vec[0]), float(vec[1]))
+        return w, out
 
     def process_frame(self, img, t: Optional[float] = None) -> CameraFix:
         """Detect markers in one BGR/gray numpy image and return a CameraFix.
@@ -476,7 +555,7 @@ class CameraTracker:
                         0.5 * ((bl[1] - tl[1]) + (br[1] - tr[1])))
                 if mid in found and found[mid][1] >= side:
                     continue           # duplicate id: keep the larger one
-                found[mid] = (centre, side, down, _marker_shape(pts))
+                found[mid] = (centre, side, down, _marker_shape(pts), pts)
                 det_draw[mid] = pts
         self.last_detections = det_draw
 
@@ -547,12 +626,35 @@ class CameraTracker:
             return (wx / ppc, wy / ppc)
 
         hr, ar = rect_rel("hip"), rect_rel("ankle")
+        # projective rectification (knee marker homography, averaged over time), blended in as it gets trusted
+        wh, hv = self._homography_vectors(found, t)
+        hrH = arH = None
+        if wh > 0.0 and kc is not None:
+            if "hip" in hv:
+                hrH = to_world_vec(*hv["hip"])
+            if "ankle" in hv:
+                arH = to_world_vec(*hv["ankle"])
+
+        def blend(a, b):
+            if b is None:
+                return a
+            d = wrap_deg(b - a)
+            if abs(d) > HOM_MAX_DEG:                     # implausible (degenerate corners): distrust H
+                return a
+            d = math.copysign(max(abs(d) - HOM_DEADBAND_DEG, 0.0), d)   # ignore corrections at the noise level
+            return wrap_deg(a + wh * d)
         held = False
         if hr is not None and math.hypot(*hr) > 1.0:
-            fix.thigh_heading_deg = wrap_deg(math.degrees(math.atan2(hr[1], -hr[0])))
+            ha = math.degrees(math.atan2(hr[1], -hr[0]))
+            if hrH is not None:
+                ha = blend(ha, math.degrees(math.atan2(hrH[1], -hrH[0])))
+            fix.thigh_heading_deg = wrap_deg(ha)
             self._thigh_hold = (t, fix.thigh_heading_deg)
         if ar is not None and math.hypot(*ar) > 1.0:
-            fix.shank_heading_deg = wrap_deg(math.degrees(math.atan2(-ar[1], ar[0])))
+            ha = math.degrees(math.atan2(-ar[1], ar[0]))
+            if arH is not None:
+                ha = blend(ha, math.degrees(math.atan2(-arH[1], arH[0])))
+            fix.shank_heading_deg = wrap_deg(ha)
         if (fix.thigh_heading_deg is None and seen.get("hip") is None and "hip" in self.ids
                 and fix.shank_heading_deg is not None and ar is not None and self._thigh_hold is not None
                 and 0.0 <= t - self._thigh_hold[0] <= self.hold_thigh_s):
@@ -601,7 +703,7 @@ class CameraTracker:
             k0 = math.degrees(math.atan2(-ar0[1], ar0[0])) - math.degrees(math.atan2(hr0[1], -hr0[0]))
             k1 = math.degrees(math.atan2(-ar[1], ar[0])) - math.degrees(math.atan2(hr[1], -hr[0]))
             delta = abs(wrap_deg(k1 - k0))
-        var = (0.35 + (CONF_K_ANISO * aniso) ** 2 + (CONF_K_SPREAD * (1.0 - size_cons)) ** 2
+        var = (0.3 + (CONF_K_ANISO * aniso) ** 2 + (CONF_K_DELTA * delta) ** 2 + (CONF_K_SPREAD * (1.0 - size_cons)) ** 2
                + (CONF_K_DEV * dev) ** 2 + (CONF_K_SMALL / max(min_side, 1.0)) ** 2 + (0.5 if held else 0.0))
         quality = 1.0 / (1.0 + var / CONF_SIGMA0 ** 2)
         fix.confidence = float(min(1.0, score * quality / CONF_QREF))
