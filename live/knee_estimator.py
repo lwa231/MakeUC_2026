@@ -1,15 +1,21 @@
 """knee_estimator.py - knee angle from two 6-bit accelerometers plus a laggy camera.
 
-One Kalman filter with state [theta, omega, alpha, b]: the accelerometers measure theta + b, the camera
-measures theta, so b soaks up accel/camera disagreement (mounting error, strap slip, and the board error
-that changes with the knee angle). Camera frames arrive 60-150 ms late and are stamped late (t_cap is
+With camera frames: one extended Kalman filter, state [theta, omega, alpha, b]. The accelerometers measure
+theta + b + the swing term + a learned error map, the camera measures theta, so b soaks up slow accel/camera
+disagreement (mounting error, strap slip). Camera frames arrive 60-150 ms late and are stamped late (t_cap is
 taken when the frame reaches the program, not at the exposure): each frame is moved back by a delay the
-filter learns from motion, then rewinds a short history to that time, updates there, and replays the
-accel samples since. The swinging shank board also feels centripetal and tangential acceleration, which
-tilts its gravity reading by up to ~10 deg in a brisk rep; it is removed using the estimated omega/alpha
-and the sensor's distance from the hinge. A One Euro filter on theta gives the display: still at rest,
-immediate in motion. Angles in degrees, 0 = straight, flexion positive. Times are seconds on the caller's
-clock (time.monotonic()); nothing in here reads a clock. Standard library only.
+filter learns from motion, then rewinds a short history to that time, updates there, and replays the accel
+samples since. Frames that disagree are gated; several frames that agree with each other but not with the
+filter relock it. The swinging shank board also feels centripetal and tangential acceleration, which tilts
+its gravity reading by up to ~10-30 deg in a brisk rep; that is part of the measurement model, using the
+sensor's distance from the hinge. While the camera watches a still knee, the filter also learns how the
+accelerometers' error changes with the knee angle (zero-g offsets, gains), which keeps helping when the
+camera drops out.
+Without camera frames (no webcam, markers lost, src = accel): a constant-velocity Kalman filter like the
+original one, retuned. src = camera: constant velocity on the camera alone.
+A One Euro filter on theta gives the display: still at rest, immediate in motion. Angles in degrees,
+0 = straight, flexion positive. Times are seconds on the caller's clock (time.monotonic()); nothing in here
+reads a clock. Standard library only. Tuning: tuning/TUNING_NOTES.md.
 """
 import math
 
