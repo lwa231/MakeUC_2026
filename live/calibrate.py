@@ -25,17 +25,15 @@ BLOCK_S = 0.25          # samples are averaged per block; stillness is judged on
 WINDOW_BLOCKS = 6       # 1.5 s rolling still window
 HOLD_BLOCKS = 8         # 2 s of vectors averaged per hold
 GAP_S = 0.2             # a gap in the data this long restarts the window
-TIMEOUT_S = 15.0        # per step
-AXIS_SD_G = 0.035       # still: per-axis sd of the block means
-ANGLE_SD_DEG = 1.0      # still: knee-angle sd of the block means
-SHIN_MAX_DEG = 12.0     # hanging shin may be this far from vertical
+TIMEOUT_S = 30.0        # per step
+AXIS_SD_G = 0.05        # still: per-axis sd of the block means (real brace at rest: ~0.01)
+ANGLE_SD_DEG = 1.5      # still: knee-angle sd of the block means (real brace at rest: ~0.5)
 BEND_MIN_DEG = 25.0     # straighten must change the knee at least this much
 BEND_NOTE_DEG = 8.0     # a still hold bent more than this (but < 25) gets the "straighten further" note
 REHANG_GATE_DEG = 10.0  # a re-hang hold must be this close to the first hang to count
-SLIP_MAX_DEG = 2.5      # re-hang vs hang
+SLIP_MAX_DEG = 5.0      # re-hang vs hang (a relaxed hanging leg repeats to a few degrees)
 EXT_MIN_DEG = -12.0     # more hyperextension than this is implausible
 OUT_OF_PLANE_G = 0.25   # z (hinge axis) reading above this: brace twisted
-POSE_MIN_G = 0.7        # bench: the pose's gravity axis must read at least this
 GAIN_RANGE = (0.8, 1.25)
 COUNTS_PER_G = 21.33    # MMA7660
 STALE_S = 4 * 3600.0    # a leg calibration older than this should be redone
@@ -52,7 +50,7 @@ PROMPTS = {
     "pose3": "Lay it on its FRONT edge, hold still.",
     "pose4": "Now the BACK edge down, hold still.",
 }
-MOVED = "Leg moved, hold still."
+MOVED = "Hold still..."
 BEND = "Couldn't see the knee bend, straighten further."
 TWISTED = "Brace twisted or toes turned out."
 TIMEOUT_HINT = {"straight": BEND, "rehang": "Re-hang didn't match: strap may have slipped, tighten and redo."}
@@ -174,13 +172,13 @@ class CalSession:
             return bend >= BEND_MIN_DEG, BEND if BEND_NOTE_DEG < bend < BEND_MIN_DEG else None
         if self.state == "rehang":
             return abs(wrap(raw_knee(m) - raw_knee(self.holds["hang"]))) < REHANG_GATE_DEG, None
-        if self.state.startswith("pose"):
+        if self.state.startswith("pose") and self.state != "pose1":
+            # Judge the turn from the thigh board's gravity direction, whichever way the boards sit
+            # in their pockets: pose 2 is pose 1 flipped, pose 3 a quarter turn from it, pose 4 is 3 flipped.
             i = int(self.state[-1])
-            axis = 0 if i <= 2 else 1                       # x (along the limb) or y (front/back)
-            prev = self.holds.get("pose%d" % (i - 1)) if i in (2, 4) else None
-            for j in (axis, axis + 3):
-                if abs(m[j]) < POSE_MIN_G or (prev and m[j] * prev[j] > 0):
-                    return False, None                      # wrong pose, or not turned over yet
+            ref = self.holds["pose%d" % (3 if i == 4 else 1)]
+            d = sum(m[j] * ref[j] for j in range(3)) / (math.hypot(*m[:3]) * math.hypot(*ref[:3]))
+            return (abs(d) < 0.5 if i == 3 else d < -0.7), None
         return True, None
 
     def _capture(self, hold, t):
@@ -195,13 +193,6 @@ class CalSession:
             self.prompt, self.message, self._t_step = self._step_prompt(), self._warn, t
 
     # ---- per-step checks and solvers; each returns a failure message or None ----
-    def _after_hang(self, h):
-        shin = math.degrees(math.atan2(abs(h[4]), abs(h[3])))     # hanging shin: gravity along x
-        if shin > SHIN_MAX_DEG:
-            return ("Shin reads %.0f deg from vertical: use Anchor mode if your knee can't bend "
-                    "that far." % shin)
-        return None
-
     def _after_straight(self, h):
         r_hang, r_str = raw_knee(self.holds["hang"]), raw_knee(h)
         self.sign = 1 if wrap(r_hang - r_str) > 0 else -1          # flexion reads positive
@@ -213,9 +204,12 @@ class CalSession:
         return None
 
     def _after_rehang(self, h):
-        rep = abs(wrap(raw_knee(h) - raw_knee(self.holds["hang"])))
+        r1, d = raw_knee(self.holds["hang"]), wrap(raw_knee(h) - raw_knee(self.holds["hang"]))
+        rep = abs(d)
         if rep > SLIP_MAX_DEG:
             return "Re-hang differs by %.1f deg: strap may have slipped, tighten and redo." % rep
+        self._k = wrap(self.sign * (r1 + d / 2.0) - 90.0)             # average both hangs
+        self._ext = wrap(self.sign * raw_knee(self.holds["straight"]) - self._k)
         ext = "%.0f deg %s straight" % (abs(self._ext), "short of" if self._ext >= 0 else "past")
         self._finish(dict(sign=self.sign, k_deg=round(self._k, 2), ext_deg=round(self._ext, 2),
                           repeat_deg=round(rep, 2)),
@@ -232,14 +226,10 @@ class CalSession:
         up, down, front, back = (self.holds["pose%d" % i] for i in (1, 2, 3, 4))
         offset, gain = [], []
         for j in range(6):
-            if j % 3 == 2:              # out-of-plane (hinge) axis: ~0 g in every pose
-                offset.append(sum(p[j] for p in (up, down, front, back)) / 4.0)
-                gain.append(1.0)
-                continue
-            a, b = (up, down) if j % 3 == 0 else (front, back)
-            offset.append((a[j] + b[j]) / 2.0)
-            # in-plane gain: the axis's swing over both pose pairs (exact for a sensor tilted in the plane)
-            gain.append(math.hypot((up[j] - down[j]) / 2.0, (front[j] - back[j]) / 2.0))
+            # Each pose pair is a 180 deg flip, so the four readings average to the zero-g offset and
+            # the in-plane swing gives the gain, however the board is turned in its pocket.
+            offset.append(sum(p[j] for p in (up, down, front, back)) / 4.0)
+            gain.append(1.0 if j % 3 == 2 else math.hypot((up[j] - down[j]) / 2.0, (front[j] - back[j]) / 2.0))
         if not all(GAIN_RANGE[0] <= g <= GAIN_RANGE[1] for g in gain):
             return "Bench poses unclear, redo the Bench check."
         worst = max(abs(o) for o in offset) * COUNTS_PER_G

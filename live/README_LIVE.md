@@ -78,8 +78,9 @@ and one status line (prompt or result). Settings go to `build/leg_state.json.tun
 If the knee cannot bend to 90 deg, hold any angle, measure it with a goniometer, type it next to
 **Anchor** and press Anchor. **Bench check** (once per brace, `live/brace_cal.json`): with the brace
 at 0 deg off the leg, hold it hip end up, hip end down, front edge down, back edge down when prompted;
-it measures each sensor's zero-g offset and gain. Messages such as "Leg moved, hold still" or "strap may
-have slipped" say what to redo.
+it measures each sensor's zero-g offset and gain. Neither procedure cares how the boards are turned in
+their pockets. "Hold still..." just means the current hold restarted; each step waits up to 30 s. Only a
+re-hang more than 5 deg off the first hang ("strap may have slipped") or a timeout ends the run: press C again.
 Quit = close the window, ESC, or Ctrl+C in the terminal; `run_live.py` then checks no `serial_bridge.py` is left holding the port.
 
 ## Troubleshooting

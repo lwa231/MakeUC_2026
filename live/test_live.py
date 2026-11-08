@@ -63,13 +63,13 @@ class Demo(unittest.TestCase):
         self.assertLess(abs(kf.x[2]), 15.0)                       # b stays usable for a switch to fused
 
     def test_calibration(self):
-        for seed, kw in ((1, {}), (2, {"mirror": True}), (3, {"deficit_deg": 15.0})):
+        for seed, kw in ((1, {}), (2, {"mirror": True, "mount": 100.0}), (3, {"deficit_deg": 15.0, "mount": 100.0})):
             run = mock_sensors.generate("calib", seed=seed, duration=30.0, **kw)
             s = self._calibrate(run)
             self.assertEqual(s.state, "done", s.prompt)
-            self.assertAlmostEqual(s.result["k_deg"], run["true_k"], delta=1.5)
+            self.assertLess(abs(KE.wrap(s.result["k_deg"] - run["true_k"])), 1.5)   # boards turned in pockets
             self.assertAlmostEqual(s.result["ext_deg"], kw.get("deficit_deg", 5.0), delta=2.0)
-        s = self._calibrate(mock_sensors.generate("calib", seed=1, duration=30.0, slip_deg=6.0))
+        s = self._calibrate(mock_sensors.generate("calib", seed=1, duration=30.0, slip_deg=8.0))
         self.assertEqual(s.state, "failed")
         self.assertIn("slip", s.prompt + s.message)
 
