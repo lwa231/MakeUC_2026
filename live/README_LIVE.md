@@ -18,11 +18,9 @@ live/run_live.py  =  launcher: finds the port, builds the viewer if missing, ope
 
 ## Before the demo (once)
 
-```bash
-cd repo
-python3 -m pip install -r requirements.txt      # pyserial (run_live.py also does this itself if missing)
-bash live/build_viewer.sh                        # builds build/viewer (run_live.py does this itself if missing)
-```
+Follow **Setup** in the [main README](../README.md): a uv Python in `.venv` (Homebrew's Python has no Tk
+and blocks pip), `bash live/build_viewer.sh`, firmware, tags. Run every command below with
+`.venv/bin/python` in place of `python3`.
 
 ## Commands (run from anywhere; shown from `repo/`)
 
