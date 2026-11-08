@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """A few end-to-end checks that the demo works: run  python3 -m unittest live/test_live.py"""
+import math
 import os
 import subprocess
 import sys
@@ -72,6 +73,55 @@ class Demo(unittest.TestCase):
         s = self._calibrate(mock_sensors.generate("calib", seed=1, duration=30.0, slip_deg=8.0))
         self.assertEqual(s.state, "failed")
         self.assertIn("slip", s.prompt + s.message)
+
+    def test_wrap_and_late_stamps(self):
+        """Raw readings past +-180 do not jump the angle, and a camera stamp ahead of the accel stream
+        does not swallow the next accel samples."""
+        kf = KE.KneeFilter(0.5)
+        kf.set_reference(60.0)
+        def v6(knee):                       # thigh level, shank at `knee` + 60 (raw wraps past 180)
+            a = math.radians(knee + 60.0)
+            return (0.0, 1.0, 0.0, math.sin(a), math.cos(a), 0.0)
+        for i in range(200):
+            th, _ = kf.accel(i * 0.01, v6(min(140.0, i * 1.0)))
+        self.assertAlmostEqual(kf.x[0], 140.0, delta=3.0)
+        self.assertTrue(kf.camera(2.5, 140.0))           # stamped 0.5 s ahead of the newest sample
+        kf.accel(2.0, v6(140.0))
+        self.assertEqual(kf.t_acc, 2.0)                  # the next sample was still used
+
+    def test_single_frame_after_dropout_is_not_believed(self):
+        run = mock_sensors.generate("default", seed=3, duration=12.0, cam_drop=0.0, cam_lost_rate=0.0,
+                                    cam_outlier=0.0)
+        _, kf = run_filter(run, w=0.75)
+        t = run["accel"][-1][0]
+        theta = kf.x[0]
+        self.assertFalse(kf.camera(t + kf.cam_delay, theta + 25.0))   # one wild frame: rejected
+        self.assertAlmostEqual(kf.x[0], theta, delta=1.0)
+        for i in range(1, 4):                                           # three that agree: relock
+            kf.accel(t + i * 0.03, run["accel"][-1][1])
+            ok = kf.camera(t + i * 0.03 + kf.cam_delay, theta + 25.0)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(kf.x[0], theta + 25.0, delta=3.0)
+
+    def test_camera_delay_is_learned(self):
+        run = mock_sensors.generate("default", seed=4, duration=60.0, cam_stamp=(0.10, 0.10))
+        _, kf = run_filter(run, w=0.75)
+        self.assertAlmostEqual(kf.cam_delay, 0.10, delta=0.03)
+
+    def test_clock_survives_host_stall(self):
+        import leg_filter
+        with tempfile.TemporaryDirectory() as d:
+            lf = leg_filter.LegFilter(os.path.join(d, "s.json"), 0.0, False)
+            ts = []
+            for k in range(300):
+                arr = 100.0 + k * 0.01 + 0.008
+                if 100 <= k < 170:                       # 0.7 s stall, then the backlog in one burst
+                    arr = 101.708 + (k - 100) * 5e-5
+                lf.on_line("%d,0,1,0,0,1,0" % (k * 10), arr)
+                ts.append(lf.t_last)
+            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            self.assertAlmostEqual(min(gaps), 0.01, delta=0.002)
+            self.assertAlmostEqual(max(gaps), 0.01, delta=0.002)
 
     @staticmethod
     def _calibrate(run):

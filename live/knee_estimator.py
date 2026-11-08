@@ -1,11 +1,15 @@
 """knee_estimator.py - knee angle from two 6-bit accelerometers plus a laggy camera.
 
-One Kalman filter with state [theta, omega, b]: the accelerometers measure theta + b, the camera
-measures theta, so b soaks up slow accel/camera disagreement (mounting error, strap slip). Camera
-frames arrive 60-120 ms late, so each one rewinds a short history to its capture time, updates
-there, and replays the accel samples since. A One Euro filter on theta gives the display: still at
-rest, immediate in motion. Angles in degrees, 0 = straight, flexion positive. Times are seconds on
-the caller's clock (time.monotonic()); nothing in here reads a clock. Standard library only.
+One Kalman filter with state [theta, omega, alpha, b]: the accelerometers measure theta + b, the camera
+measures theta, so b soaks up accel/camera disagreement (mounting error, strap slip, and the board error
+that changes with the knee angle). Camera frames arrive 60-150 ms late and are stamped late (t_cap is
+taken when the frame reaches the program, not at the exposure): each frame is moved back by a delay the
+filter learns from motion, then rewinds a short history to that time, updates there, and replays the
+accel samples since. The swinging shank board also feels centripetal and tangential acceleration, which
+tilts its gravity reading by up to ~10 deg in a brisk rep; it is removed using the estimated omega/alpha
+and the sensor's distance from the hinge. A One Euro filter on theta gives the display: still at rest,
+immediate in motion. Angles in degrees, 0 = straight, flexion positive. Times are seconds on the caller's
+clock (time.monotonic()); nothing in here reads a clock. Standard library only.
 """
 import math
 
@@ -15,17 +19,37 @@ R_ACC0 = 4.0          # accel knee variance per 100 Hz sample at w = 0 (deg^2); 
 R_CAM0 = R_ACC0 * 0.3 # camera variance per 30 Hz frame at w = 1, so w = 0.5 is equal information
 DEV_G = 0.05          # accel R grows by (dev/DEV_G)^2 with dev = ||a| - 1 g| beyond DEAD_G (motion)
 DEAD_G = 0.04         # |a| error ignored as noise / zero-g offset (g)
-Q_B = 0.5 ** 2        # random walk of b while the camera is fused (deg^2/s): strap slip, not jitter
+Q_B = 0.5 ** 2        # random walk of b while the camera is fused (deg^2/s): strap slip
+Q_BW = 0.02           # ... plus this per degree of knee travel (deg^2/deg): board error varies with angle
+Q_J0 = 2.0e6          # white jerk density at resp = 0.5 (deg^2/s^5)
+ALPHA_TAU = 0.25      # angular acceleration decorrelates over this time (s)
+Q_CAM_A = 3000.0      # camera only: white angular-acceleration density at resp = 0.5 (deg^2/s^3)
 GATE = 4.0            # reject camera frames whose innovation exceeds this many sigma
-RELOCK_S = 1.0        # ... unless they have disagreed this long: then trust the camera and reset b
+RELOCK_N = 3          # ... unless this many rejected frames
+RELOCK_S = 0.4        # ... within this long
+RELOCK_SD = 3.0       # ... lie on a line to within this (deg): then the camera is right, relock to it
 HIST_S = 0.5          # history kept for late camera frames (s); older frames are dropped
 GAP_S = 0.05          # accel silence that starts coasting (s)
 COAST_TAU = 0.2       # while coasting omega decays with this time constant (s)
 CAM_STALE_S = 0.3     # camera-only: no accepted frame for this long also coasts (s)
 CAM_OK_S = 0.5        # cam_ok while a frame was accepted this recently (s)
+EURO_FMIN = (0.1, 0.4)  # display (One Euro) cutoff at rest: a + b * resp (Hz)
+EURO_BETA = (0.1, 0.4)  # ... plus this (a + b * resp, Hz) per deg/s of speed
 SPEED_DEAD = 5.0      # display: speeds below this (deg/s) count as rest noise
 BLIP_SIGMA = 3.0      # accel samples further than this from the prediction are jolts: down-weighted
-ACC_H, CAM_H = (1.0, 0.0, 1.0), (1.0, 0.0, 0.0)  # measurement rows: accel = theta + b, camera = theta
+G = 9.80665           # m/s^2
+R_SHANK_M = 0.118     # hinge -> shank sensor pocket centre (hardware/brace/brace.py sensor_pos)
+OMEGA_MAX = 600.0     # the swing model trusts at most this knee speed (deg/s) ...
+ALPHA_MAX = 4000.0    # ... and acceleration (deg/s^2); a brisk 90 deg rep in 0.5 s peaks near 2100
+DYN_RES = 0.3         # share of the modelled swing acceleration kept as uncertainty (lever arm, axes)
+CAM_DELAY0 = 0.04     # first guess of exposure -> t_cap (s); learned while the knee moves
+CAM_DELAY_MAX = 0.25
+CAM_DELAY_GAIN = 0.03 # learning rate of the camera delay (per frame in motion)
+CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
+CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
+CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
+CAM_H = (1.0, 0.0, 0.0, 0.0)  # camera row: camera = theta (accel = theta + b + swing, see _accel_z)
+N = 4
 
 
 def wrap(a):
@@ -45,34 +69,48 @@ def raw_knee(v6):
 
 
 def q_from_resp(resp):
-    """Responsiveness 0..1 -> white angular-acceleration density (deg^2/s^3); 0.5 -> 3000."""
-    return 3000.0 * 10.0 ** (2.0 * (resp - 0.5))
+    """Responsiveness 0..1 -> white jerk density (deg^2/s^5); x100 per +1."""
+    return Q_J0 * 10.0 ** (2.0 * (resp - 0.5))
 
 
 def _predict(x, P, dt, q, qb, coast):
-    """Constant velocity; when coasting omega decays (tau COAST_TAU) instead of running away."""
-    f = math.exp(-dt / COAST_TAU) if coast else 1.0
-    a = COAST_TAU * (1.0 - f) if coast else dt          # how far omega carries theta over dt
-    F = ((1.0, a, 0.0), (0.0, f, 0.0), (0.0, 0.0, 1.0))
-    FP = [[sum(F[i][k] * P[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
-    P = [[sum(FP[i][k] * F[j][k] for k in range(3)) for j in range(3)] for i in range(3)]
-    P[0][0] += q * dt ** 3 / 3.0
-    P[0][1] += q * dt * dt / 2.0
-    P[1][0] += q * dt * dt / 2.0
-    P[1][1] += q * dt
-    P[2][2] += qb * dt
-    return [x[0] + a * x[1], f * x[1], x[2]], P
+    """Constant acceleration (alpha decaying over ALPHA_TAU) driven by white jerk. Coasting (no data):
+    alpha is dropped and omega decays (tau COAST_TAU) so theta settles instead of running away."""
+    if q < 0.0:                          # constant velocity (camera only), white acceleration density -q
+        F = ((1.0, dt, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    if coast:
+        f = math.exp(-dt / COAST_TAU)
+        F = ((1.0, COAST_TAU * (1.0 - f), 0.0, 0.0), (0.0, f, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+    elif q >= 0.0:
+        e = math.exp(-dt / ALPHA_TAU)
+        F = ((1.0, dt, 0.5 * dt * dt, 0.0), (0.0, 1.0, dt, 0.0), (0.0, 0.0, e, 0.0), (0.0, 0.0, 0.0, 1.0))
+    xn = [sum(F[i][k] * x[k] for k in range(N)) for i in range(N)]
+    FP = [[sum(F[i][k] * P[k][j] for k in range(N) if F[i][k]) for j in range(N)] for i in range(N)]
+    Pn = [[sum(FP[i][k] * F[j][k] for k in range(N) if F[j][k]) for j in range(N)] for i in range(N)]
+    d2, d3 = dt * dt, dt * dt * dt
+    if q < 0.0:
+        Pn[0][0] -= q * d3 / 3.0
+        Pn[0][1] -= q * d2 / 2.0
+        Pn[1][0] -= q * d2 / 2.0
+        Pn[1][1] -= q * dt
+    else:
+        Q = ((d3 * d2 / 20.0, d2 * d2 / 8.0, d3 / 6.0), (d2 * d2 / 8.0, d3 / 3.0, d2 / 2.0), (d3 / 6.0, d2 / 2.0, dt))
+        for i in range(3):
+            for j in range(3):
+                Pn[i][j] += q * Q[i][j]
+    Pn[3][3] += qb * dt
+    return xn, Pn
 
 
 def _innovation(x, P, h, z, r):
-    ph = [P[i][0] * h[0] + P[i][2] * h[2] for i in range(3)]   # P h^T (h[1] is always 0)
-    return ph, ph[0] * h[0] + ph[2] * h[2] + r, z - (x[0] * h[0] + x[2] * h[2])
+    ph = [sum(P[i][k] * h[k] for k in range(N) if h[k]) for i in range(N)]   # P h^T
+    return ph, sum(ph[k] * h[k] for k in range(N) if h[k]) + r, z - sum(x[k] * h[k] for k in range(N))
 
 
 def _update(x, P, ph, s, nu):
     k = [p / s for p in ph]
-    return ([x[i] + k[i] * nu for i in range(3)],
-            [[P[i][j] - k[i] * ph[j] for j in range(3)] for i in range(3)])
+    return ([x[i] + k[i] * nu for i in range(N)],
+            [[P[i][j] - k[i] * ph[j] for j in range(N)] for i in range(N)])
 
 
 class OneEuro:
@@ -81,16 +119,26 @@ class OneEuro:
     def __init__(self, y=None, t=None):
         self.y, self.t, self.speed = y, t, 0.0
 
+    def _next(self, t, x, omega, fmin, beta):
+        dt = t - self.t
+        speed = self.speed + (omega - self.speed) / (1.0 + 1.0 / (2.0 * math.pi * 2.0 * dt))
+        fc = fmin + beta * max(0.0, abs(speed) - SPEED_DEAD)
+        return self.y + (x - self.y) / (1.0 + 1.0 / (2.0 * math.pi * fc * dt)), speed
+
     def __call__(self, t, x, omega, fmin, beta):
         if self.y is None or t <= self.t:
             self.y = x if self.y is None else self.y
-            self.t = t
+            self.t = t if self.t is None else max(self.t, t)
             return self.y
-        dt, self.t = t - self.t, t
-        self.speed += (omega - self.speed) / (1.0 + 1.0 / (2.0 * math.pi * 2.0 * dt))
-        fc = fmin + beta * max(0.0, abs(self.speed) - SPEED_DEAD)
-        self.y += (x - self.y) / (1.0 + 1.0 / (2.0 * math.pi * fc * dt))
+        self.y, self.speed = self._next(t, x, omega, fmin, beta)
+        self.t = t
         return self.y
+
+    def peek(self, t, x, omega, fmin, beta):
+        """The output at t without committing it (coasting previews must not move the filter's clock)."""
+        if self.y is None or t <= self.t:
+            return x if self.y is None else self.y
+        return self._next(t, x, omega, fmin, beta)[0]
 
 
 class KneeFilter:
@@ -100,11 +148,18 @@ class KneeFilter:
         self.w, self.resp, self.src = w, resp, "fused"
         self.k = 0.0                 # accel reference: theta = raw_knee - k (+ b)
         self.calibrated = False
+        self.r_shank = R_SHANK_M     # lever arm of the shank board (m); 0 turns the swing correction off
         self.x = self.P = None       # state and covariance at time self.t
-        self.t = None
-        self.hist = []               # [t, z, r, h, x, P] per measurement, last HIST_S seconds
-        self.t_cam = -1e9            # capture time of the last accepted camera frame
-        self.rej_since = None        # capture time of the first of the current run of rejects
+        self.t = None                # time of the newest history entry (never ahead of the accel stream)
+        self.t_acc = None            # time of the newest accel sample
+        self.z_acc = None            # newest accel knee reading (theta + b)
+        # history: [t, kind (0 accel, 1 camera, 2 camera relock), meas, r, x, P, t_acc, z], last HIST_S
+        self.hist = []
+        self.t_cam = -1e9            # (delay-corrected) time of the last accepted camera frame
+        self.cam_delay = CAM_DELAY0  # learned exposure -> t_cap delay (s)
+        self.cam_var = R_CAM0        # learned camera angle variance (deg^2) at w = 1
+        self.rej = []                # recently rejected camera frames [(t, knee)]
+        self.n_relock = 0
         self.euro = OneEuro()
         self.set(w, resp)
 
@@ -113,113 +168,215 @@ class KneeFilter:
         self.resp = self.resp if resp is None else min(1.0, max(0.0, resp))
         self.src = src or self.src
         self.w_eff = {"accel": 0.0, "camera": 1.0}.get(self.src, self.w)
-        self.q = q_from_resp(self.resp)
-        self.fmin = 0.1 + 0.4 * self.resp        # display cutoff at rest (Hz)
-        self.beta = 0.1 + 0.4 * self.resp        # extra cutoff (Hz) per deg/s of speed
+        # camera only: nothing between the 30 Hz frames, so a jerk model would overshoot every stop;
+        # use constant velocity instead (q < 0 flags it: white acceleration density -q)
+        self.q = -Q_CAM_A * 10.0 ** (2.0 * (self.resp - 0.5)) if self.w_eff >= 1.0 else q_from_resp(self.resp)
+        self.fmin = EURO_FMIN[0] + EURO_FMIN[1] * self.resp    # display cutoff at rest (Hz)
+        self.beta = EURO_BETA[0] + EURO_BETA[1] * self.resp    # extra cutoff (Hz) per deg/s of speed
 
     @property
     def cam_ok(self):
         return self.t is not None and self.w_eff > 0.0 and self.t - self.t_cam < CAM_OK_S
 
-    def _step(self, x, P, t0, e):
-        """Advance (x, P) from t0 to history entry e and apply its measurement (r None = skip)."""
-        t, z, r, h = e[0], e[1], e[2], e[3]
-        dt = t - t0
+    # ---- measurement models ----
+    def _accel_z(self, x, m, w_eff=None):
+        """Accel measurement for state x: (z, h, r, zc). z = raw knee - k (unwrapped near the prediction),
+        h = its linearised row, r = its variance, zc = z with the modelled swing removed (theta + b).
+
+        The shank board sits r_shank from the hinge, so it also feels r*omega^2 towards the hinge and r*alpha
+        along its path. Seen through its tilt, that adds d = (r/g)(omega^2 cos theta + alpha sin theta) rad
+        to the knee reading (the board hangs straight down at theta = 90; true for any mounting in the
+        mapped frame, where the reading rises with theta). It is part of the model (an EKF), not subtracted
+        from the input: alpha is too noisy to subtract, but the filter can weigh it."""
+        tau_t, sx, sy, sz, dev_t = m
+        th = math.radians(x[0])
+        w = math.radians(max(-OMEGA_MAX, min(OMEGA_MAX, x[1])))
+        a = math.radians(max(-ALPHA_MAX, min(ALPHA_MAX, x[2])))
+        c, sn = math.cos(th), math.sin(th)
+        kr = self.r_shank / G
+        d = math.degrees(kr * (w * w * c + a * sn))
+        h = (1.0 + kr * (a * c - w * w * sn),                    # d(theta + b + d)/dx (0 where clipped)
+             kr * 2.0 * w * c if abs(x[1]) < OMEGA_MAX else 0.0,
+             kr * sn if abs(x[2]) < ALPHA_MAX else 0.0, 1.0)
+        pred = x[0] + x[3] + d
+        z = pred + wrap(tilt(sx, sy) - tau_t - self.k - pred)    # continuous near the prediction
+        # |a| of the shank also changes with the swing (by (r/g)(omega^2 sin theta - alpha cos theta));
+        # what is left beyond that is unmodelled motion or a jolt
+        norm = math.sqrt(sx * sx + sy * sy + sz * sz) - 1.0 - kr * (w * w * sn - a * c)
+        dev = max(dev_t, abs(norm))
+        w_eff = self.w_eff if w_eff is None else w_eff
+        r = (R_ACC0 / max(1e-6, 1.0 - w_eff) * (1.0 + (max(0.0, dev - DEAD_G) / DEV_G) ** 2)
+             + (DYN_RES * d) ** 2)
+        return z, h, r, z - d, pred
+
+    def _step(self, x, P, prev, e):
+        """Advance (x, P) from history entry prev to entry e and apply e's measurement (fills e[4:])."""
+        t, kind = e[0], e[1]
+        if kind == 2:                                 # camera relock: a reset, not a measurement
+            e[6] = prev[6]
+            return e[4], e[5]
+        dt = t - prev[0]
         camera_fused = self.w_eff > 0.0 and t - self.t_cam < CAM_OK_S
-        coast = dt > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
-        x, P = _predict(x, P, dt, self.q, Q_B if camera_fused else 0.0, coast)
-        if r is not None:
-            ph, s, nu = _innovation(x, P, h, z, r)
-            if h is ACC_H and nu * nu > BLIP_SIGMA ** 2 * s:     # jolt, not a real angle change (Huber)
-                ph, s, nu = _innovation(x, P, h, z, r * nu * nu / (BLIP_SIGMA ** 2 * s))
+        coast = t - prev[6] > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
+        qb = (Q_B + Q_BW * abs(x[1])) if camera_fused else 0.0
+        x, P = _predict(x, P, dt, self.q, qb, coast)
+        z = None
+        if kind == 0:
+            # the camera share only discounts the accelerometers while camera frames are actually fused
+            zm, h, r, z, pred = self._accel_z(x, e[2], self.w_eff if camera_fused else 0.0)
+            if self.w_eff < 1.0:
+                zl = zm - pred + sum(h[k] * x[k] for k in range(N))     # linearised about x
+                ph, s, nu = _innovation(x, P, h, zl, r)
+                if nu * nu > BLIP_SIGMA ** 2 * s:     # jolt, not a real angle change (Huber)
+                    ph, s, nu = _innovation(x, P, h, zl, r * nu * nu / (BLIP_SIGMA ** 2 * s))
+                x, P = _update(x, P, ph, s, nu)
+        elif e[3] is not None:
+            ph, s, nu = _innovation(x, P, CAM_H, x[0] + wrap(e[2] - x[0]), e[3])
             x, P = _update(x, P, ph, s, nu)
+        e[4:] = [x, P, t if kind == 0 else prev[6], z]
         return x, P
+
+    def _replay(self, i):
+        """Recompute history from entry i on (entry i-1 is the starting state)."""
+        H = self.hist
+        x, P = H[i - 1][4], H[i - 1][5]
+        for j in range(i, len(H)):
+            x, P = self._step(x, P, H[j - 1], H[j])
+        self.x, self.P = x, P
 
     def accel(self, t, v6):
         """One accelerometer sample at time t. Returns the display (theta, omega)."""
-        z = self.z_acc = raw_knee(v6) - self.k
+        tau_t = tilt(v6[0], v6[1])
+        m = (tau_t, v6[3], v6[4], v6[5], abs(math.sqrt(v6[0] ** 2 + v6[1] ** 2 + v6[2] ** 2) - 1.0))
         if self.x is None:
-            self.x, self.P, self.t = [z, 0.0, 0.0], [[4.0, 0, 0], [0, 100.0 ** 2, 0], [0, 0, 3.0 ** 2]], t
-            self.hist = [[t, z, None, ACC_H, self.x, self.P]]
+            z = wrap(raw_knee(v6) - self.k)
+            self.x, self.P, self.t = [z, 0.0, 0.0, 0.0], self._p0(4.0, 3.0 ** 2), t
+            self.t_acc, self.z_acc = t, z
+            self.hist = [[t, 0, m, None, self.x, self.P, t, z]]
             return self.euro(t, z, 0.0, self.fmin, self.beta), 0.0
         if t <= self.t:
             return self.euro.y, self.x[1]       # out-of-order or duplicate stamp
-        r = None
-        if self.w_eff < 1.0:
-            dev = max(abs(math.sqrt(v6[0] ** 2 + v6[1] ** 2 + v6[2] ** 2) - 1.0),
-                      abs(math.sqrt(v6[3] ** 2 + v6[4] ** 2 + v6[5] ** 2) - 1.0))
-            r = R_ACC0 / (1.0 - self.w_eff) * (1.0 + (max(0.0, dev - DEAD_G) / DEV_G) ** 2)
-        e = [t, z, r, ACC_H]
-        self.x, self.P = self._step(self.x, self.P, self.t, e)
-        self.t = t
-        self.hist.append(e + [self.x, self.P])
+        e = [t, 0, m, None, None, None, None, None]
+        self.x, self.P = self._step(self.x, self.P, self.hist[-1], e)
+        self.t, self.t_acc, self.z_acc = t, t, e[7]
+        self.hist.append(e)
         n = 0
         while n < len(self.hist) - 1 and self.hist[n + 1][0] < t - HIST_S:
             n += 1
         del self.hist[:n]
         return self.euro(t, self.x[0], self.x[1], self.fmin, self.beta), self.x[1]
 
-    def camera(self, t_cap, knee):
-        """One camera knee angle captured at t_cap (may be up to HIST_S old). Returns accepted."""
+    @staticmethod
+    def _p0(var_theta, var_b):
+        P = [[0.0] * N for _ in range(N)]
+        P[0][0], P[1][1], P[2][2], P[3][3] = var_theta, 100.0 ** 2, 1000.0 ** 2, var_b
+        return P
+
+    def camera(self, t_cap, knee, conf=1.0):
+        """One camera knee angle stamped t_cap (its true exposure is ~cam_delay earlier, up to HIST_S
+        old). conf (0..1) scales its weight. Returns True if it was used."""
         if knee is None or self.x is None or self.w_eff <= 0.0:
             return False
         H = self.hist
+        t = min(t_cap - self.cam_delay, self.t)          # never ahead of the accel stream
         i = len(H)
-        while i > 0 and H[i - 1][0] > t_cap:
+        while i > 0 and H[i - 1][0] > t:
             i -= 1
         if i == 0:
-            return False                          # older than the history
-        r = R_CAM0 / self.w_eff
-        x, P = self._step(H[i - 1][4], H[i - 1][5], H[i - 1][0], [t_cap, 0.0, None, CAM_H])
-        ph, s, nu = _innovation(x, P, CAM_H, knee, r)
+            return False                                  # older than the history
+        r = max(R_CAM0, self.cam_var) / self.w_eff / max(0.5, min(1.0, conf if conf is not None else 1.0)) ** 2
+        e = [t, 1, knee, r, None, None, None, None]
+        x, P = _predict(H[i - 1][4], H[i - 1][5], t - H[i - 1][0], self.q, 0.0, t - H[i - 1][6] > GAP_S)
+        nu = wrap(knee - x[0])
+        s = P[0][0] + r
         if nu * nu > GATE * GATE * s:
-            if self.rej_since is None:
-                self.rej_since = t_cap
-            if t_cap - self.rej_since < RELOCK_S and t_cap - self.t_cam < RELOCK_S:
+            self.rej = [f for f in self.rej if t - RELOCK_S <= f[0] < t] + [(t, x[0] + nu)]
+            fit = self._line(self.rej) if len(self.rej) >= RELOCK_N else None
+            if fit is None:
                 return False
-            # Camera disagreed for a second or is back after a dropout: believe it and re-derive b
-            # from the latest accel reading (theta may be a stale prediction in camera-only mode)
-            x = [knee, x[1], self.z_acc - knee]
-            P = [[r, 0.0, -r], [0.0, P[1][1], 0.0], [-r, 0.0, P[0][0] + 2.0 * P[0][2] + P[2][2] + r]]
+            # Several frames agree with each other and not with the filter: the filter is wrong (camera
+            # back after a dropout, strap slipped, or a runaway prediction). Restart theta/omega on them and
+            # re-derive b from the accel reading at that time.
+            theta, omega = fit
+            z_acc = H[i - 1][7] if H[i - 1][7] is not None else self.z_acc
+            x = [theta, omega, 0.0, (z_acc - theta) if self.w_eff < 1.0 else x[3]]
+            P = self._p0(r, r + R_ACC0)
+            P[1][1], P[2][2] = 30.0 ** 2, 300.0 ** 2
+            e[1], e[3] = 2, None                          # a reset entry: replays keep it
+            e[4:] = [x, P, H[i - 1][6], None]
+            self.rej, self.n_relock = [], self.n_relock + 1
         else:
+            if self.w_eff < 1.0 and abs(x[1]) > CAM_DELAY_SPEED:
+                # The camera shows the knee as it was cam_delay before t_cap; a wrong delay leaves an
+                # innovation of -omega * (delay error). Learn it (frames in both directions average out
+                # angle offsets).
+                err = max(-0.1, min(0.1, -nu / x[1]))
+                wt = x[1] * x[1] / (x[1] * x[1] + 100.0 ** 2)
+                self.cam_delay = max(0.0, min(CAM_DELAY_MAX, self.cam_delay + CAM_DELAY_GAIN * wt * err))
+            if abs(x[1]) < CAM_VAR_SPEED:
+                # Learn how noisy this camera really is (innovation^2 minus the filter's own share), from
+                # frames at rest where timing errors do not matter. Clipped so outliers count only a little.
+                v = min(nu * nu, (GATE * GATE / 4.0) * s) - P[0][0]
+                self.cam_var += CAM_VAR_GAIN * (max(0.0, v) - self.cam_var)
+            ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
-        self.rej_since = None
-        self.t_cam = max(self.t_cam, t_cap)
-        H.insert(i, [t_cap, knee, r, CAM_H, x, P])
-        for k in range(i + 1, len(H)):            # replay everything measured since the capture
-            x, P = self._step(x, P, H[k - 1][0], H[k])
-            H[k][4], H[k][5] = x, P
-        self.x, self.P, self.t = x, P, max(self.t, t_cap)
+            e[4:] = [x, P, H[i - 1][6], None]
+            self.rej = []
+        self.t_cam = max(self.t_cam, t)
+        H.insert(i, e)
+        if i + 1 < len(H):
+            self._replay(i + 1)
+        else:
+            self.x, self.P = x, P
         return True
+
+    @staticmethod
+    def _line(fr):
+        """Least-squares line through frames [(t, knee)] -> (knee at the newest t, slope) if they all lie
+        within RELOCK_SD of it, else None."""
+        n = len(fr)
+        tm = sum(f[0] for f in fr) / n
+        km = sum(f[1] for f in fr) / n
+        stt = sum((f[0] - tm) ** 2 for f in fr)
+        slope = sum((f[0] - tm) * (f[1] - km) for f in fr) / stt if stt > 1e-9 else 0.0
+        slope = max(-400.0, min(400.0, slope))
+        if max(abs(f[1] - km - slope * (f[0] - tm)) for f in fr) > RELOCK_SD:
+            return None
+        return km + slope * (fr[-1][0] - tm), slope
 
     def tick(self, t):
         """Coast output while the accelerometers are silent; None while they are streaming."""
-        if self.x is None or t - self.t <= GAP_S:
+        if self.x is None or t - self.t_acc <= GAP_S:
             return None
         x, _ = _predict(self.x, self.P, t - self.t, 0.0, 0.0, True)
-        return self.euro(t, x[0], x[1], self.fmin, self.beta), x[1]
+        return self.euro.peek(t, x[0], x[1], self.fmin, self.beta), x[1]
 
     def _rebase(self, k_new, theta_now):
         """New accel reference: theta := theta_now, b := 0, history restarts (snap the display)."""
         if self.x is None:
             return
         self.k = k_new
-        self.x = [theta_now, self.x[1], 0.0]
-        self.P = [[self.P[0][0], self.P[0][1], 0.0], [self.P[1][0], self.P[1][1], 0.0], [0.0, 0.0, 3.0 ** 2]]
-        self.hist = [[self.t, theta_now, None, ACC_H, self.x, self.P]]
+        self.x = [theta_now, self.x[1], self.x[2], 0.0]
+        P = [row[:] for row in self.P]
+        for j in range(N):
+            P[3][j] = P[j][3] = 0.0
+        P[3][3] = 3.0 ** 2
+        self.P = P
+        self.hist = [[self.t, 0, self.hist[-1][2], None, self.x, self.P, self.t_acc, theta_now]]
+        self.rej = []
         self.euro = OneEuro(theta_now, self.t)
 
     def zero(self, theta_now_target=0.0):
         """Quick zero: the current (filtered) accel reading becomes theta_now_target.
         Not a calibration: the extension deficit is unknown, so calibrated becomes False."""
         if self.x is not None:
-            self._rebase(self.k + self.x[0] + self.x[2] - theta_now_target, theta_now_target)
+            self._rebase(self.k + self.x[0] + self.x[3] - theta_now_target, theta_now_target)
             self.calibrated = False
 
     def set_reference(self, k_deg):
         """Calibrated offset from calibrate.py: displayed theta = raw knee - k_deg."""
         if self.x is not None:
-            self._rebase(k_deg, self.x[0] + self.x[2] + self.k - k_deg)
+            self._rebase(k_deg, wrap(self.x[0] + self.x[3] + self.k - k_deg))
         else:
             self.k = k_deg
         self.calibrated = True

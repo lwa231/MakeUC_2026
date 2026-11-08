@@ -11,8 +11,9 @@ Live (stands in for serial_bridge.py + the camera):
     mock_sensors.py [--scenario S] [--seed N] [--cam-out PATH] [--no-camera] [--duration S]
     prints `t_ms,tx,ty,tz,sx,sy,sz,0,0,0,0,truth` at 100 Hz and writes camera frames to PATH.
 
-Angles: 0 = straight, flexion positive. Mock frame per board: x along the limb, z out of the limb, so a board
-on a horizontal limb reads z = +1 g, and the hanging shank (knee 90) reads x = +1 g (x points at the knee).
+Angles: 0 = straight, flexion positive. Mock frame per board (flat on its bar): x along the limb,
+y out of the limb in the bending plane, z the hinge axis; a board on a horizontal limb reads y = +1 g, and
+the hanging shank (knee 90) reads x = +1 g (x points at the knee).
 Standard library only, Python 3.9+.
 """
 import argparse
@@ -42,16 +43,19 @@ DEFAULTS = dict(
     partial=0.15, partial_to=(30.0, 60.0),      # share of half extensions, and how far they get
     tremor=0.04,                        # tremor amplitude (deg) at 7.3 Hz
     sway=1.0,                           # thigh drift scale (1 = a few deg)
-    noise=0.4,                          # accel noise, sd in counts (flickers +-1 count)
+    noise=(0.25, 0.6),                  # accel noise, sd in counts (flickers +-1 count); one draw per brace
     offset=3.0, gain=0.08,              # max zero-g offset (counts) and gain error per axis (datasheet)
     mount=5.0,                          # max mounting tilt of each board on the leg (deg)
-    leak=(1.0, 4.0),                    # out-of-plane board tilt (deg): part of gravity shows on y
-    r=0.15,                             # shank board distance below the knee (m)
+    leak=(1.0, 8.0),                    # out-of-plane board tilt (deg): part of gravity shows on the hinge axis
+    r=(0.10, 0.14),                     # shank board distance below the knee (m; CAD: 0.118); one draw per brace
     mirror=False,                       # boards turned 180 deg about the limb (right leg): bend sign flips
     hw_seed=None,                       # seed for the board/mounting draw (default: seed)
     stall_rate=0.2, stall=(0.01, 0.04),  # host stalls (per s, s): lines then arrive in a burst
     cam_noise=1.5,                      # camera angle noise, sd (deg), plus 0.01 deg per deg/s of motion
     cam_lat=(0.06, 0.12),               # capture -> file arrival latency (s)
+    cam_fps=30.0,                       # camera frame rate (the panel's Tk loop may deliver fewer)
+    cam_stamp=(0.02, 0.07),             # t_cap is stamped when read() returns, this much after the exposure:
+    cam_stamp_jit=0.004,                #   one draw per run (s), plus per-frame jitter sd (s)
     cam_drop=0.05,                      # frames without a fix
     cam_lost_rate=1 / 20.0, cam_lost=(0.5, 2.0),  # marker-lost dropouts (per s, s)
     cam_outlier=0.01,                   # frames off by 10-30 deg
@@ -163,7 +167,13 @@ def hardware(p, seed):
     return dict(offset=[clipped(p["offset"]) for _ in range(6)],
                 gain=[1.0 + clipped(p["gain"]) for _ in range(6)],
                 leak=[math.radians(rng.choice((-1, 1)) * rng.uniform(*p["leak"])) for _ in range(2)],
-                mount_th=rng.uniform(-p["mount"], p["mount"]), mount_sh=rng.uniform(-p["mount"], p["mount"]))
+                mount_th=rng.uniform(-p["mount"], p["mount"]), mount_sh=rng.uniform(-p["mount"], p["mount"]),
+                r=_draw(rng, p["r"]), noise=_draw(rng, p["noise"]))
+
+
+def _draw(rng, v):
+    """A (lo, hi) range draws uniformly; a plain number is used as is."""
+    return rng.uniform(*v) if isinstance(v, (tuple, list)) else float(v)
 
 
 def read_board(p, hw, rng, board, tilt_deg, fx=0.0, fz=0.0):
@@ -177,7 +187,7 @@ def read_board(p, hw, rng, board, tilt_deg, fx=0.0, fz=0.0):
     out = []
     for j, g in enumerate(g3):
         a = 3 * board + j
-        c = round(g * hw["gain"][a] * CPG + hw["offset"][a] + rng.gauss(0.0, p["noise"]))
+        c = round(g * hw["gain"][a] * CPG + hw["offset"][a] + rng.gauss(0.0, hw["noise"]))
         out.append(print_g(max(-32, min(31, c))))
     return out
 
@@ -195,7 +205,7 @@ def accel_stream(p, hw, truth, rng):
         # Shank lever arm: centripetal r*w^2 along x (toward the knee), tangential r*alpha against z.
         v6 = (read_board(p, hw, rng, 0, th + hw["mount_th"]) +
               read_board(p, hw, rng, 1, th + knee + hw["mount_sh"] + slip,
-                         p["r"] * w * w / G, -p["r"] * alpha / G))
+                         hw["r"] * w * w / G, -hw["r"] * alpha / G))
         arr = math.ceil((t + LINE_S) / USB_S) * USB_S + rng.expovariate(2500.0)
         while p["stall_rate"] > 0 and arr > stall[1]:
             s0 = stall[1] + rng.expovariate(p["stall_rate"])
@@ -207,11 +217,14 @@ def accel_stream(p, hw, truth, rng):
 
 
 def cam_stream(p, truth, rng):
-    """Yields (t_arrival, t_cap, knee_or_None) forever, in arrival order."""
+    """Yields (t_arrival, t_stamp, knee_or_None) forever, in arrival order. knee is the true angle at the
+    exposure time t; t_stamp (what the camera code reports as t_cap) is later by an unknown delay."""
     t, prev, lost_until = 0.2, 0.0, -1.0
+    stamp = rng.uniform(*p["cam_stamp"])
     while True:
-        t += (2 if rng.random() < 0.1 else 1) / 30.0 + rng.gauss(0.0, 0.002)   # ~10% of frames come late
+        t += (2 if rng.random() < 0.1 else 1) / p["cam_fps"] + rng.gauss(0.0, 0.002)   # ~10% of frames come late
         arr = prev = max(t + rng.uniform(*p["cam_lat"]) + rng.gauss(0.0, 0.005), prev + 0.001)
+        t_stamp = min(arr, t + max(0.0, stamp + rng.gauss(0.0, p["cam_stamp_jit"])))
         if rng.random() < p["cam_lost_rate"] / 30.0:
             lost_until = t + rng.uniform(*p["cam_lost"])
         knee = None
@@ -220,7 +233,7 @@ def cam_stream(p, truth, rng):
             knee = ang + rng.gauss(0.0, p["cam_noise"] + 0.01 * abs(rate))
             if rng.random() < p["cam_outlier"]:
                 knee += rng.choice((-1, 1)) * rng.uniform(10.0, 30.0)
-        yield arr, t, knee
+        yield arr, t_stamp, knee
 
 
 def _setup(scenario, seed, overrides):

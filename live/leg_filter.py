@@ -29,6 +29,7 @@ SERIAL_LAT_S = 0.008    # best-case sample-to-arrival delay (I2C reads + one 115
 CLOCK_CREEP = 0.005     # s per s the device-to-host clock offset may rise (crystal skew)
 CAM_LATENCY_S = 0.08    # capture-to-file delay assumed for camera frames without t_cap
 CAM_MIN_CONF = 0.5      # camera frames below this confidence are ignored
+REANCHOR_S = 1.0       # a device->host offset this much higher for this long is a new clock, not a stall
 COAST_AFTER_S = 0.1     # accel silence before coasting output starts (USB stalls are shorter)
 CAL_SILENT_S = 15.0     # a calibration gives up after this long without sensor data
 
@@ -41,6 +42,7 @@ class LegFilter:
         self.st, self.leg, self.leg_cal, self.mapping = {}, None, None, None
         self.kf, self.reset, self.out, self.t_out = KneeFilter(), False, [], 0.0   # t_out: last K line
         self.off = self.t_last = self.t_arr = self.t0 = None       # device clock -> host clock
+        self.t_dev, self.t_high = 0.0, None                        # last device time, offset-high since
         self.cal, self.last_cal, self.cal_msg, self.cal_t = None, None, "", 0.0   # running / last CalSession
         self.cam_mtime, self.cam_key, self.cam_mean, self.cam_sign = None, None, 0.0, 1.0
         self.n_acc = self.n_cam = 0
@@ -89,9 +91,18 @@ class LegFilter:
             return                      # not a sample line
         # Device clock -> host clock: lower envelope of (arrival - t_dev), so samples keep their
         # device spacing through USB bursts; it creeps up for crystal skew and re-anchors on a reset.
+        # Re-anchor only on a device restart (t_ms went back) or an offset that stays high for a while
+        # (bridge reconnect); a host stall also raises d for one burst, but the lower envelope rides it out.
         d = now - t_dev
-        self.off = d if self.off is None or d > self.off + 0.5 else \
-            min(self.off + CLOCK_CREEP * (now - self.t_arr), d)
+        if self.off is None or t_dev < self.t_dev - 0.001:
+            self.off, self.t_high = d, None
+        elif d > self.off + 0.5:
+            self.t_high = now if self.t_high is None else self.t_high
+            if now - self.t_high > REANCHOR_S:
+                self.off, self.t_high = d, None
+        else:
+            self.off, self.t_high = min(self.off + CLOCK_CREEP * (now - self.t_arr), d), None
+        self.t_dev = t_dev
         t = t_dev + self.off - SERIAL_LAT_S
         t = t if self.t_last is None else max(t, self.t_last + 1e-4)
         self.t_last, self.t_arr, self.n_acc = t, now, self.n_acc + 1
@@ -133,7 +144,7 @@ class LegFilter:
         if abs(self.cam_mean) > 8.0:
             self.cam_sign = 1.0 if self.cam_mean > 0 else -1.0
         self.n_cam += 1
-        self.kf.camera(t_cap, self.cam_sign * knee)
+        self.kf.camera(t_cap, self.cam_sign * knee, float(d.get("conf") or 0.0))
 
     def poll_files(self):
         if self.cal and time.monotonic() - self.cal_t > CAL_SILENT_S:
