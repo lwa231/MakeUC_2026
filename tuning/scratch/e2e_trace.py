@@ -21,7 +21,7 @@ def one(job):
     scen, seed, setup = job
     for k, v in OV.items():
         setattr(KE, k, float(v))
-    frames = json.load(open(E.cache_path(scen, seed, setup)))
+    frames = E.load_frames(scen, seed, setup)
     ctx = E.with_camera(E.FB.prepare(scen, seed), frames)
     truth = ctx["truth_fn"]
     out = []

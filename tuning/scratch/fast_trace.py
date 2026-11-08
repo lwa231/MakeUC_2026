@@ -4,7 +4,7 @@ import e2e_camera as E
 KE = E.FB.KE
 for kv in sys.argv[1:]:
     k, v = kv.split("="); setattr(KE, k, float(v))
-frames = json.load(open(E.cache_path("fast", 1, E.SETUPS[0])))
+frames = E.load_frames("fast", 1, E.SETUPS[0])
 ctx = E.with_camera(E.FB.prepare("fast", 1), frames); tr = ctx["truth_fn"]
 kf = KE.KneeFilter(0.75, 0.5); z = False; acc = rej = 0; log = []
 for t, c, d in ctx["events"]:

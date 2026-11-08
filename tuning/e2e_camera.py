@@ -30,45 +30,69 @@ SEEDS = (1, 2)
 FPS, LAT, STAMP, CAM_MIN_CONF = 30.0, (0.06, 0.12), (0.02, 0.07), 0.5
 
 
+ORIG_CAM = os.path.join(HERE, "camera_origin_v1_orig.py")     # camera_origin.py before this tuning work
+MOUNT = os.environ.get("E2E_MOUNT", "leg")      # "leg": markers on a curved leg; "brace": on the brace (CAD)
+VARIANT = os.environ.get("E2E_CAM", "new")      # which tracker's output to fuse: "new" or "orig"
+
+
 def cam_hash():
     if os.environ.get("E2E_HASH"):          # reuse frames rendered with an earlier camera_origin.py
         return os.environ["E2E_HASH"]
-    return hashlib.sha1(open(os.path.join(ROOT, "camera_origin.py"), "rb").read()).hexdigest()[:10]
+    h = hashlib.sha1(open(os.path.join(ROOT, "camera_origin.py"), "rb").read()).hexdigest()[:8]
+    return "%s_%s2" % (MOUNT, h)
+
+
+def _tracker_cls(path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("cam_%d" % (abs(hash(path)) % 10 ** 8), path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod            # dataclasses look their module up while the file runs
+    spec.loader.exec_module(mod)
+    return mod.CameraTracker
 
 
 def gen_camera(job):
-    """Render and track one run's camera frames. Returns [(t_stamp, t_arrival, knee|None, conf)]."""
+    """Render one run's camera frames and track each with the current and the original camera_origin.
+    Returns {"new": [...], "orig": [...]}, items (t_stamp, t_arrival, knee|None, conf, t_exposure)."""
     scen, seed, setup = job
     import numpy as np
     import random
     import sim_camera as SC
-    from camera_origin import CameraTracker
+    import zlib
     name, res, dist, view, light = setup
     ctx = FB.prepare(scen, seed)
     truth = ctx["truth_fn"]
-    rng = np.random.default_rng([seed, hash(name) % 1000, 7])
+    rng = np.random.default_rng([seed, zlib.crc32(name.encode()) % 1000, 7])
     prng = random.Random("e2e:%s:%d:%s" % (scen, seed, name))
     cam = SC.Cam(w=res[0], h=res[1], hfov=70.0, dist=dist, yaw=view * prng.choice((-1, 1)),
                  pitch=0.5 * view * prng.choice((-1, 1)), k1=-0.05)
-    pose0 = SC.sample_pose(SC.Scenario(view=view, speeds=(0,)), 0, rng)
+    pose0 = SC.sample_pose(SC.Scenario(view=view, speeds=(0,), mount=MOUNT), 0, rng)
     degr = SC.sample_degr(light, rng)
-    tr = CameraTracker(marker_cm=SC.MARKER_CM)
+    trackers = {"new": _tracker_cls(os.path.join(ROOT, "camera_origin.py"))(marker_cm=SC.MARKER_CM),
+                "orig": _tracker_cls(ORIG_CAM)(marker_cm=SC.MARKER_CM)}
+    outs = {k: [] for k in trackers}
     stamp = prng.uniform(*STAMP)
-    out, t, prev = [], 0.2, 0.0
+    t, prev = 0.2, 0.0
     while t < FB.DURATION:
         ang, rate, _ = truth.motion(t)
         pose = SC.replace(pose0, theta=ang, omega=rate)
         img, _ = SC.render(pose, cam, degr, rng)
-        fix = tr.process_frame(img, t + stamp)
         arr = prev = max(t + prng.uniform(*LAT), prev + 0.001)
-        knee = fix.camera_knee_deg if fix.confidence >= CAM_MIN_CONF else None
-        out.append((min(arr, fix.t), arr, knee, float(fix.confidence), t))
+        for k, tr in trackers.items():
+            fix = tr.process_frame(img, t + stamp)
+            knee = fix.camera_knee_deg if fix.confidence >= CAM_MIN_CONF else None
+            outs[k].append((min(arr, fix.t), arr, knee, float(fix.confidence), t))
         t += (2 if prng.random() < 0.1 else 1) / FPS + prng.gauss(0.0, 0.002)
-    return out
+    return outs
 
 
 def cache_path(scen, seed, setup):
     return os.path.join(CACHE, "%s_%d_%s_%s.json" % (scen, seed, setup[0], cam_hash()))
+
+
+def load_frames(scen, seed, setup):
+    d = json.load(open(cache_path(scen, seed, setup)))
+    return d[VARIANT] if isinstance(d, dict) else d
 
 
 def build_cache(procs=None):
@@ -94,7 +118,7 @@ def _job(args):
     scen, seed, setup, w, overrides = args
     for k, v in overrides.items():
         setattr(FB.KE, k, v)
-    frames = json.load(open(cache_path(scen, seed, setup)))
+    frames = load_frames(scen, seed, setup)
     ctx = with_camera(FB.prepare(scen, seed), frames)
     m = FB.evaluate(ctx, w, FB.KE.RESP_DEFAULT)
     got = [f for f in frames if f[2] is not None]

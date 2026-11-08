@@ -7,7 +7,7 @@ for sc in E.SCENS:
     for seed in E.SEEDS:
         tr = E.FB.prepare(sc, seed)["truth_fn"]
         for st in E.SETUPS:
-            fr = json.load(open(E.cache_path(sc, seed, st)))
+            fr = E.load_frames(sc, seed, st)
             th = np.array([tr(f[4]) for f in fr if f[2] is not None]); er = np.array([f[2] - tr(f[4]) for f in fr if f[2] is not None])
             rate = np.array([abs(tr.motion(f[4])[1]) for f in fr if f[2] is not None])
             A = np.column_stack([np.ones_like(th), th / 90, (th / 90) ** 2]); c, *_ = np.linalg.lstsq(A, er, rcond=None)
