@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+
+# Generated or not meant for the repo (rebuild with brace.py)
+concepts/
+previews/
+result.json
+out/*.stl
+out/cuff_*
