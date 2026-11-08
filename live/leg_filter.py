@@ -143,7 +143,9 @@ class LegFilter:
         # The 2D camera angle's sign depends on the side it films from; flexion is mostly positive.
         self.cam_mean += 0.01 * (knee - self.cam_mean)
         if abs(self.cam_mean) > 8.0:
-            self.cam_sign = 1.0 if self.cam_mean > 0 else -1.0
+            sign = 1.0 if self.cam_mean > 0 else -1.0
+            if sign != self.cam_sign:          # what was learned from mirrored frames is wrong: forget it
+                self.cam_sign, self.kf.cmap, self.kf.rej = sign, [0.0] * len(self.kf.cmap), []
         self.n_cam += 1
         self.kf.camera(t_cap, self.cam_sign * knee, float(d.get("conf") or 0.0))
 

@@ -71,9 +71,13 @@ CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
 CMAP_GAIN = 0.050      # learning rate of the accelerometer error map (per still camera frame); 0 = off
-CMAP_TERMS = 4        # ... using sin/cos of theta (2) or of theta and 2 theta (4)
+CMAP_TERMS = 5        # ... using a constant and sin/cos of theta (3) or also of 2 theta (5)
 CMAP_SPEED = 30.0     # ... learned only from frames slower than this (deg/s)
 CMAP_MAX_ERR = 15.0   # ... and only when accel and camera disagree by less than this (deg)
+CMAP_CALM_S = 1.5     # ... and no camera frame was rejected for this long (s)
+CMAP_LEAK = 0.002     # ... each step pulls the map this much back towards zero
+CMAP_MAX = 10.0       # ... and no coefficient exceeds this (deg)
+CAM_AHEAD_S = 0.3     # a frame this far ahead of the newest accel sample means the accel stream is silent
 CONF_POW = 0.0        # camera variance is divided by confidence^CONF_POW (confidence 0.5..1)
 CAM_H = (1.0, 0.0, 0.0, 0.0)  # camera row: camera = theta (accel = theta + b + swing, see _accel_z)
 N = 4
@@ -129,13 +133,23 @@ def _predict(x, P, dt, q, qb, coast):
     return xn, Pn
 
 
+def _cmap_features(theta):
+    """Basis of the learned accel error map: a constant, then sin/cos of theta and of 2 theta."""
+    a = math.radians(theta)
+    return (1.0, math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a))
+
+
 def _guard(x):
     """Keep the state physical whatever the inputs: a knee lives in THETA_LIM, and omega / alpha stay below
     OMEGA_LIM / ALPHA_LIM (never reached by a real leg). Stops wrap-around and runaway in every mode."""
     if (THETA_LIM[0] <= x[0] <= THETA_LIM[1] and abs(x[1]) <= OMEGA_LIM and abs(x[2]) <= ALPHA_LIM):
         return x
-    return [max(THETA_LIM[0], min(THETA_LIM[1], x[0])), max(-OMEGA_LIM, min(OMEGA_LIM, x[1])),
-            max(-ALPHA_LIM, min(ALPHA_LIM, x[2])), x[3]]
+    th = max(THETA_LIM[0], min(THETA_LIM[1], x[0]))
+    w = max(-OMEGA_LIM, min(OMEGA_LIM, x[1]))
+    a = max(-ALPHA_LIM, min(ALPHA_LIM, x[2]))
+    if th != x[0] and w * (x[0] - th) > 0.0:      # pinned at a limit: do not keep "moving" outwards
+        w = a = 0.0
+    return [th, w, a, x[3]]
 
 
 def _innovation(x, P, h, z, r):
@@ -195,7 +209,8 @@ class KneeFilter:
         self.cam_delay = CAM_DELAY0  # learned exposure -> t_cap delay (s)
         self.cam_var = R_CAM0        # learned camera angle variance (deg^2) at w = 1
         self.rej = []                # recently rejected camera frames [(t, knee)]
-        self.cmap = [0.0] * 4        # learned accel error vs knee angle (sin, cos, sin 2x, cos 2x; deg)
+        self.cmap = [0.0] * 5        # learned accel error vs knee angle (1, sin, cos, sin 2x, cos 2x; deg)
+        self.t_rej = -1e9            # time of the last rejected camera frame
         self.n_relock = 0
         self.euro = OneEuro()
         self.set(w, resp)
@@ -248,7 +263,7 @@ class KneeFilter:
              kr * 2.0 * w * c if abs(x[1]) < OMEGA_MAX else 0.0,
              kr * sn if abs(x[2]) < ALPHA_MAX else 0.0, 1.0)
         g, dg = self._cmap(x[0])
-        h = (h[0] + dg, h[1], h[2], h[3])
+        h = (max(0.5, h[0] + dg), h[1], h[2], h[3])     # never let the slope collapse
         pred = x[0] + x[3] + d + g
         z = pred + wrap(tilt(sx, sy) - tau_t - self.k - pred)    # continuous near the prediction
         # |a| of the shank also changes with the swing (by (r/g)(omega^2 sin theta - alpha cos theta));
@@ -339,7 +354,7 @@ class KneeFilter:
             return False
         H = self.hist
         t = t_cap - self.cam_delay
-        if t > self.t + GAP_S:
+        if t > self.t + CAM_AHEAD_S:
             return False      # the accelerometers have gone quiet: frames would pile up at one instant
         t = min(t, self.t)                               # never ahead of the accel stream
         i = len(H)
@@ -362,6 +377,7 @@ class KneeFilter:
             wt = x[1] * x[1] / (x[1] * x[1] + 100.0 ** 2)
             self.cam_delay = max(0.0, min(CAM_DELAY_MAX, self.cam_delay + CAM_DELAY_GAIN * wt * err))
         if not nu * nu <= GATE * GATE * s:
+            self.t_rej = t
             self.rej = [f for f in self.rej if t - RELOCK_S <= f[0] < t] + [(t, x[0] + nu)]
             fit = self._line(self.rej) if len(self.rej) >= RELOCK_N else None
             if fit is None:
@@ -384,18 +400,22 @@ class KneeFilter:
                 v = min(nu * nu, (GATE * GATE / 4.0) * s) - P[0][0]
                 self.cam_var += CAM_VAR_GAIN * (max(0.0, v) - self.cam_var)
             z_acc = H[i - 1][7]
-            if CMAP_GAIN > 0.0 and self.w_eff < 1.0 and abs(x[1]) < CMAP_SPEED and z_acc is not None:
+            if (CMAP_GAIN > 0.0 and self.w_eff < 1.0 and abs(x[1]) < CMAP_SPEED and z_acc is not None
+                    and t - self.t_rej > CMAP_CALM_S):
                 # The accelerometers' error (zero-g offsets, gains, mounting) is a smooth function of the knee
                 # angle that b, a constant, cannot follow from one hold to the next. While the camera watches a
-                # still knee, learn it (normalised LMS on sin/cos of theta and 2 theta); it then also corrects
-                # the accelerometers when the camera drops out.
+                # still knee and has agreed with the filter for a while, learn it (normalised LMS, slowly leaking
+                # and capped). The map learns the accelerometers' WHOLE disagreement with the camera (b is not
+                # subtracted), so its target does not depend on b: b only carries what the map has not learned
+                # yet, and the two cannot integrate each other. It keeps correcting the accelerometers when the
+                # camera drops out.
                 th = x[0] + nu
-                err = (z_acc - x[3] - self._cmap(th)[0]) - th
+                err = (z_acc - th) - self._cmap(th)[0]
                 if abs(err) < CMAP_MAX_ERR:
-                    a = math.radians(th)
-                    ph_ = (math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a))[:int(CMAP_TERMS)]
-                    k_ = CMAP_GAIN * err / (sum(f * f for f in ph_) + 1e-6)
-                    self.cmap = [c + k_ * f for c, f in zip(self.cmap, ph_)] + self.cmap[len(ph_):]
+                    ph_ = _cmap_features(th)[:int(CMAP_TERMS)]
+                    k_ = CMAP_GAIN * err / (sum(f * f for f in ph_) + 1e-3)
+                    self.cmap = [max(-CMAP_MAX, min(CMAP_MAX, (1.0 - CMAP_LEAK) * c + k_ * f))
+                                 for c, f in zip(self.cmap, ph_)] + self.cmap[len(ph_):]
             ph, s, nu = _innovation(x, P, CAM_H, x[0] + nu, r)
             x, P = _update(x, P, ph, s, nu)
             x = _guard(x)
@@ -436,15 +456,16 @@ class KneeFilter:
         if not any(c):
             return 0.0, 0.0
         a = math.radians(theta)
+        f = _cmap_features(theta)
         s1, c1, s2, c2 = math.sin(a), math.cos(a), math.sin(2 * a), math.cos(2 * a)
-        return (c[0] * s1 + c[1] * c1 + c[2] * s2 + c[3] * c2,
-                math.radians(c[0] * c1 - c[1] * s1 + 2 * c[2] * c2 - 2 * c[3] * s2))
+        return (sum(ci * fi for ci, fi in zip(c, f)),
+                math.radians(c[1] * c1 - c[2] * s1 + 2 * c[3] * c2 - 2 * c[4] * s2))
 
     def _rebase(self, k_new, theta_now):
         """New accel reference: theta := theta_now, b := 0, history restarts (snap the display)."""
         if self.x is None:
             return
-        self.cmap = [0.0] * 4          # learned against the old reference
+        self.cmap = [0.0] * 5          # learned against the old reference
         self.k = k_new
         self.x = [theta_now, self.x[1], self.x[2], 0.0]
         P = [row[:] for row in self.P]
