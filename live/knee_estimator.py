@@ -70,7 +70,7 @@ CAM_DELAY_STEP = 0.06 # one frame's delay error estimate is clipped to this (s)
 CAM_VAR_GAIN = 0.02   # learning rate of the camera noise (per frame at rest)
 CAM_VAR_SPEED = 20.0  # ... frames count as "at rest" below this speed (deg/s)
 CAM_DELAY_SPEED = 30.0  # frames are used for the delay only above this speed (deg/s)
-CMAP_GAIN = 0.050      # learning rate of the accelerometer error map (per still camera frame); 0 = off
+CMAP_GAIN = 0.010      # learning rate of the accelerometer error map (per still camera frame); 0 = off
 CMAP_TERMS = 5        # ... using a constant and sin/cos of theta (3) or also of 2 theta (5)
 CMAP_SPEED = 30.0     # ... learned only from frames slower than this (deg/s)
 CMAP_MAX_ERR = 15.0   # ... and only when accel and camera disagree by less than this (deg)

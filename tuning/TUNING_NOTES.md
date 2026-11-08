@@ -21,9 +21,11 @@ same files, same commands, same keys/panel. `main.cpp`, `serial_bridge.py` and `
   relocks only when ≥3 rejected frames within 0.4 s lie on a line. Before, any frame after a 1 s dropout
   was believed unconditionally.
 - **Learned accelerometer error map.** The boards' zero-g offset and gain errors make the accel error change
-  with the knee angle, which one constant offset `b` can't follow. While the camera sees a still knee, the
-  filter learns this error as sin/cos of θ and 2θ. It also keeps correcting the accelerometers when the
-  camera drops out.
+  with the knee angle, which one constant offset `b` can't follow.
+  - While the camera sees a still knee and has agreed with the filter for 1.5 s, the filter learns the
+    accelerometers' total disagreement with the camera. The map is a constant plus sin/cos of θ and 2θ,
+    with a slow leak and a ±10° cap.
+  - It keeps correcting the accelerometers when the camera drops out.
 - **No camera frames** (no webcam, markers lost, or Sensors source): the filter uses a constant-velocity model
   like the original (ablation: the swing model needs a good α, which only the camera-steadied model has), with
   its own retuned settings. Camera share `w` no longer discounts the accelerometers when no camera frames are
@@ -98,27 +100,64 @@ Metrics:
 - **J** = rms + lag/40 + 10·jit (the teammates' score; lower is better).
 
 **Most realistic: frames rendered through the tracker, markers on the brace as in the CAD.** 24 runs:
-default / fast / slow motion × 2 seeds × 4 camera setups (good, 18° angled, far 640×480, dim).
+default / fast / slow motion × 2 seeds × 4 camera setups (good, 18° angled, far 640×480, dim). Every
+frame is tracked by both the original and the new `camera_origin.py`.
 
-| Stack | Fused rms | p95 | lag | jit | J | Accel-only rms | Camera-only rms |
+| Stack (camera + filter) | Fused rms | p95 | lag | jit | J | Accel-only rms | Camera-only rms |
 |---|---|---|---|---|---|---|---|
-| original camera + original filter | 7.81 | 16.1 | 88 | 0.24 | 12.45 | 6.31 | 23.5 |
-| original camera + new filter | 4.69 | 9.2 | 49 | 0.22 | 8.12 | 6.18 | 18.2 |
-| **new camera + new filter** | **4.34** | **8.6** | **49** | **0.21** | **7.65** | 6.18 | 17.7 |
+| original + original | 7.81 | 16.1 | 88 | 0.24 | 12.45 | 6.31 | 23.5 |
+| original camera + new filter | 4.77 | 9.2 | 48 | 0.26 | 8.62 | 6.18 | 18.2 |
+| new camera + original filter | 7.56 | 15.5 | 88 | 0.27 | 12.49 | 6.31 | 22.5 |
+| **new + new** | **4.47** | **8.7** | **47** | **0.25** | **8.10** | 6.18 | 17.7 |
 
 Camera alone, angled setup: 2.27° → 0.42° error. Curved-leg mounting gives the same picture: fused
-7.85 → 4.48 rms. Full table: `tuning/e2e_final_matrix.txt`.
+7.85 → 4.59 rms. Full table: `tuning/e2e_final_matrix.txt`.
 
-**Mock scenarios, held-out seeds** (`tuning/bench_v6_test.txt` vs `bench_orig_test_v5mock.txt`):
+**Mock scenarios, held-out seeds** (10 scenarios incl. no-webcam, strap slip, 6–10 s camera loss;
+`tuning/bench_v8_test.txt` vs `tuning/bench_orig_test_final.txt`):
 
 | Mode | Original rms / p95 / lag / jit | New rms / p95 / lag / jit |
 |---|---|---|
-| fused (w = 0.75) | 7.96 / 16.6 / 87 / 0.48 | 5.66 / 10.7 / 50 / 0.48 |
-| accel only | 5.85 / 11.7 / 43 / 0.38 | 5.81 / 11.8 / 45 / 0.30 |
+| fused (w = 0.75) | 7.73 / 16.0 / 85 / 0.46 | 5.44 / 10.5 / 53 / 0.45 |
+| accel only | 5.70 / 11.4 / 43 / 0.38 | 5.67 / 11.4 / 45 / 0.29 |
 | no webcam at default settings | 4.73 / 9.0 / 45 / 0.30 | 4.40 / 8.5 / 43 / 0.28 |
-| camera only | 28.1 / 52.6 / 114 / 3.5 | 24.9 / 49.6 / 117 / 1.9 |
+| camera only | 30.4 / 57.3 / 113 / 3.1 | 27.7 / 54.7 / 118 / 1.8 |
 
-At rest with the camera, the fused angle now tracks the camera (≈0.7–2° in default/slow runs, was 3–5°).
+Other checks:
+- **At rest with the camera** the fused angle now tracks the camera: ≈0.7–2° in default/slow runs (was 3–5°).
+- **Long sessions** (`tuning/scratch/long_session.py`: 15 min with camera, then 60 s without, 4 seeds):
+
+  | | Original | New |
+  |---|---|---|
+  | Fused rms, last minute | 2.4–5.5° | 2.0–4.6° |
+  | Accel-only rms after the camera is lost | 3.0–4.7° | 2.0–4.8° (better on 3 of 4 seeds) |
+
+  The learned error map stays small (|c| ≤ 4°).
+
+## Review loop
+Three independent Sonnet reviews of the diff; every substantiated finding was fixed:
+- **Review 1:**
+  - Single-frame relock after a dropout.
+  - Late `t_cap` swallowing accel samples.
+  - Missing angle wrap.
+  - Motion weighting blind to tangential acceleration.
+  - Clock squeeze after a host stall.
+  - Coast display freeze.
+  - Calibration straighten direction: not fixed, see limits.
+- **Review 2:**
+  - Offset stat index.
+  - NaN poisoning.
+  - Camera frames piling up while the accel stream is silent.
+  - Learned delay lost on remap.
+  - Inconsistent predict models.
+  - Stray-marker / ramp / heading-source issues in the camera code.
+- **Review 3:**
+  - Error map and offset drifting together over long sessions. Fixed structurally: the map learns the total
+    accel−camera disagreement, plus a leak, a cap and a calm gate.
+  - Guard pinning ω.
+  - Garbage kept after a camera sign flip.
+  - Too-eager frame skipping.
+  - Camera ramp steps.
 
 ## Honest limits / not done
 - Everything is simulated. The real camera latency, lighting, marker print quality and strap behaviour may
