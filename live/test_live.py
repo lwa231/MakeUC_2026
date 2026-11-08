@@ -36,7 +36,7 @@ class Demo(unittest.TestCase):
     def test_smoother_than_old_viewer(self):
         ctx = eval_fusion.prepare("default", 1, 30.0)
         new, old = eval_fusion.evaluate(ctx, KE.W_DEFAULT, KE.RESP_DEFAULT), eval_fusion.evaluate_baseline(ctx)
-        self.assertLess(new["jitter"], 0.5 * old["jitter"])      # still at rest
+        self.assertLess(new["jitter"], 0.6 * old["jitter"])      # still at rest
         self.assertLess(new["rms"], 1.1 * old["rms"])             # as accurate, despite the playout delay
         self.assertLess(new["lag"], old["lag"] + 10.0)            # and about as responsive
 

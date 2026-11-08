@@ -290,7 +290,7 @@ static float playoutAngle(double tr) {
 static const char* const kSrcNames[3] = {"fused", "accel", "camera"};
 static struct {
     std::string path;  // <state>.viewer
-    double w = 0.15, resp = 0.5;
+    double w = 0.75, resp = 0.5;
     int src = 0;       // index into kSrcNames
     long zeroSeq = 0, calSeq = 0;
     bool dirty = false;

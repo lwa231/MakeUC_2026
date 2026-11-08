@@ -100,7 +100,7 @@ class LegFilter:
         if inv:
             tx, sx = -tx, -sx
         if rot:
-            sx, sz = -sx, -sz
+            sx, sy = -sx, -sy
         theta, omega = self.kf.accel(t, (tx, ty, tz, sx, sy, sz))
         if self.auto_zero and t - self.t0 >= self.auto_zero:
             self.auto_zero = 0.0

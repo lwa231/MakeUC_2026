@@ -19,6 +19,8 @@ import os
 import time
 from collections import deque
 
+from knee_estimator import raw_knee, wrap  # same angle convention as the live filter
+
 BLOCK_S = 0.25          # samples are averaged per block; stillness is judged on block means
 WINDOW_BLOCKS = 6       # 1.5 s rolling still window
 HOLD_BLOCKS = 8         # 2 s of vectors averaged per hold
@@ -32,7 +34,7 @@ BEND_NOTE_DEG = 8.0     # a still hold bent more than this (but < 25) gets the "
 REHANG_GATE_DEG = 10.0  # a re-hang hold must be this close to the first hang to count
 SLIP_MAX_DEG = 2.5      # re-hang vs hang
 EXT_MIN_DEG = -12.0     # more hyperextension than this is implausible
-OUT_OF_PLANE_G = 0.25   # y (hinge axis) reading above this: brace twisted
+OUT_OF_PLANE_G = 0.25   # z (hinge axis) reading above this: brace twisted
 POSE_MIN_G = 0.7        # bench: the pose's gravity axis must read at least this
 GAIN_RANGE = (0.8, 1.25)
 COUNTS_PER_G = 21.33    # MMA7660
@@ -54,18 +56,6 @@ MOVED = "Leg moved, hold still."
 BEND = "Couldn't see the knee bend, straighten further."
 TWISTED = "Brace twisted or toes turned out."
 TIMEOUT_HINT = {"straight": BEND, "rehang": "Re-hang didn't match: strap may have slipped, tighten and redo."}
-
-
-def wrap(a):
-    return (a + 180.0) % 360.0 - 180.0
-
-
-def tilt(x, z):
-    return math.degrees(math.atan2(x, z))
-
-
-def raw_knee(v6):
-    return wrap(tilt(v6[3], v6[5]) - tilt(v6[0], v6[2]))
 
 
 def apply_bench(bench, v6):
@@ -186,7 +176,7 @@ class CalSession:
             return abs(wrap(raw_knee(m) - raw_knee(self.holds["hang"]))) < REHANG_GATE_DEG, None
         if self.state.startswith("pose"):
             i = int(self.state[-1])
-            axis = 0 if i <= 2 else 2                       # x (along the limb) or z (front/back)
+            axis = 0 if i <= 2 else 1                       # x (along the limb) or y (front/back)
             prev = self.holds.get("pose%d" % (i - 1)) if i in (2, 4) else None
             for j in (axis, axis + 3):
                 if abs(m[j]) < POSE_MIN_G or (prev and m[j] * prev[j] > 0):
@@ -195,8 +185,8 @@ class CalSession:
 
     def _capture(self, hold, t):
         self.holds[self.state] = hold
-        if self.state in ("hang", "straight", "hold") and max(abs(hold[1]), abs(hold[4])) > OUT_OF_PLANE_G:
-            self._warn = TWISTED                            # a warning only: the y axis is not used
+        if self.state in ("hang", "straight", "hold") and max(abs(hold[2]), abs(hold[5])) > OUT_OF_PLANE_G:
+            self._warn = TWISTED                            # a warning only: the z axis is not used
         err = getattr(self, "_after_" + self.state, lambda h: None)(hold)
         if err:
             self._fail(err)
@@ -206,7 +196,7 @@ class CalSession:
 
     # ---- per-step checks and solvers; each returns a failure message or None ----
     def _after_hang(self, h):
-        shin = math.degrees(math.atan2(abs(h[5]), abs(h[3])))     # hanging shin: gravity along x
+        shin = math.degrees(math.atan2(abs(h[4]), abs(h[3])))     # hanging shin: gravity along x
         if shin > SHIN_MAX_DEG:
             return ("Shin reads %.0f deg from vertical: use Anchor mode if your knee can't bend "
                     "that far." % shin)
@@ -242,7 +232,7 @@ class CalSession:
         up, down, front, back = (self.holds["pose%d" % i] for i in (1, 2, 3, 4))
         offset, gain = [], []
         for j in range(6):
-            if j % 3 == 1:              # out-of-plane axis: ~0 g in every pose
+            if j % 3 == 2:              # out-of-plane (hinge) axis: ~0 g in every pose
                 offset.append(sum(p[j] for p in (up, down, front, back)) / 4.0)
                 gain.append(1.0)
                 continue

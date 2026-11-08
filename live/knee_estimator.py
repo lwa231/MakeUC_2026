@@ -9,7 +9,7 @@ the caller's clock (time.monotonic()); nothing in here reads a clock. Standard l
 """
 import math
 
-W_DEFAULT = 0.15      # camera share of trust (0 = accelerometers only, 1 = camera only); eval_fusion.py
+W_DEFAULT = 0.75      # camera share of trust (0 = accelerometers only, 1 = camera only): camera leads
 RESP_DEFAULT = 0.5    # responsiveness 0..1: higher follows faster, lower is smoother at rest
 R_ACC0 = 4.0          # accel knee variance per 100 Hz sample at w = 0 (deg^2); 6-bit steps are 2.7 deg
 R_CAM0 = R_ACC0 * 0.3 # camera variance per 30 Hz frame at w = 1, so w = 0.5 is equal information
@@ -24,6 +24,7 @@ COAST_TAU = 0.2       # while coasting omega decays with this time constant (s)
 CAM_STALE_S = 0.3     # camera-only: no accepted frame for this long also coasts (s)
 CAM_OK_S = 0.5        # cam_ok while a frame was accepted this recently (s)
 SPEED_DEAD = 5.0      # display: speeds below this (deg/s) count as rest noise
+BLIP_SIGMA = 3.0      # accel samples further than this from the prediction are jolts: down-weighted
 ACC_H, CAM_H = (1.0, 0.0, 1.0), (1.0, 0.0, 0.0)  # measurement rows: accel = theta + b, camera = theta
 
 
@@ -32,14 +33,15 @@ def wrap(a):
     return (a + 180.0) % 360.0 - 180.0
 
 
-def tilt(x, z):
-    """Sagittal tilt (deg) of one accelerometer's gravity vector."""
-    return math.degrees(math.atan2(x, z))
+def tilt(x, y):
+    """Sagittal tilt (deg) of one accelerometer's gravity vector. The boards lie flat on the brace
+    bars, so the knee bends in each board's x-y plane and z is the hinge axis."""
+    return math.degrees(math.atan2(x, y))
 
 
 def raw_knee(v6):
     """Knee angle straight from one sample: thigh xyz then shank xyz, in g."""
-    return wrap(tilt(v6[3], v6[5]) - tilt(v6[0], v6[2]))
+    return wrap(tilt(v6[3], v6[4]) - tilt(v6[0], v6[1]))
 
 
 def q_from_resp(resp):
@@ -127,7 +129,10 @@ class KneeFilter:
         coast = dt > GAP_S or (self.w_eff >= 1.0 and t - self.t_cam > CAM_STALE_S)
         x, P = _predict(x, P, dt, self.q, Q_B if camera_fused else 0.0, coast)
         if r is not None:
-            x, P = _update(x, P, *_innovation(x, P, h, z, r))
+            ph, s, nu = _innovation(x, P, h, z, r)
+            if h is ACC_H and nu * nu > BLIP_SIGMA ** 2 * s:     # jolt, not a real angle change (Huber)
+                ph, s, nu = _innovation(x, P, h, z, r * nu * nu / (BLIP_SIGMA ** 2 * s))
+            x, P = _update(x, P, ph, s, nu)
         return x, P
 
     def accel(self, t, v6):

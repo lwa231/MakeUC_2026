@@ -167,10 +167,11 @@ def hardware(p, seed):
 
 
 def read_board(p, hw, rng, board, tilt_deg, fx=0.0, fz=0.0):
-    """printG values (x, y, z) of board 0 (thigh) or 1 (shank) at tilt_deg, plus motion fx/fz (g)."""
+    """printG values (x, y, z) of board 0 (thigh) or 1 (shank) at tilt_deg, plus motion fx/fz (g).
+    Boards lie flat on the bars like the real brace: x along the limb, y front/back, z = hinge axis."""
     phi, lk = math.radians(tilt_deg), hw["leak"][board]
-    x, z = math.sin(phi) + fx, math.cos(phi) + fz
-    g3 = (x, z * math.sin(lk), z * math.cos(lk))
+    x, y = math.sin(phi) + fx, math.cos(phi) + fz
+    g3 = (x, y * math.cos(lk), y * math.sin(lk))
     if p["mirror"]:
         g3 = (x, -g3[1], -g3[2])
     out = []
